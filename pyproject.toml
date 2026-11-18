@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyreach"
+version = "0.1.0"
+description = "Which vulnerability alerts actually affect a Python project? Deterministic reachability first, LLM second, fail-closed."
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31"]
+
+[project.scripts]
+pyreach = "pyreach.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["pyreach*"]
