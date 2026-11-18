@@ -24,6 +24,11 @@ pyreach scan fixtures/app_getattr --advisory examples/advisory-sample.json --out
 # Phase 5, execution proof:
 pyreach scan fixtures/app_vuln --advisory examples/advisory-sample.json --with-proof --out report.json
 
+# Explainer, uncertain results only (deterministic first; LLM layer
+# only with a key — same .env auto-enable as Phase 4):
+pyreach scan fixtures/app_getattr_config --advisory examples/advisory-sample.json --explain --no-llm --out report.json
+pyreach explain --report report.json --project fixtures/app_getattr_config --no-llm
+
 python -m pytest tests/ -q
 ```
 
@@ -40,9 +45,19 @@ python -m pytest tests/ -q
    No key -> stays uncertain, which is safe.
 5. Execution proof in an isolated subprocess, plus a PR debate agent
    that must cite a line or flip to uncertain.
+6. **Explainer for uncertain results** (`--explain` / `explain`):
+   deterministic explanation first — blocker, partial path, blocked
+   edge, one discriminating check, what is not known — then optionally
+   one verified LLM explanation. The LLM never changes a verdict:
+   its JSON must say `verdict: "uncertain"`, its blocker must match
+   the deterministic one, and every cited snippet must match the code
+   verbatim, or the answer is rejected and only the deterministic
+   explanation is shown. Lines are labelled `[deterministic]` vs
+   `[llm-explainer]`; no key means deterministic only.
 
-See `PHASES.md` for implementation details for Phases 1-5, the design
-question answers, the 24-hour timeline, and the demo script.
+See `PHASES.md` for implementation details for Phases 1-5 and the
+explainer, the design question answers, the 24-hour timeline, and the
+demo script.
 
 ## Build priority — revised after ChatGPT review, 18 Nov 2026
 
@@ -83,6 +98,8 @@ unknown — do not accuse anyone, just do not follow it.
   new dependency; real env vars always win over .env; the key value
   is never printed or written into a report). See `.env.example`.
 - `pyreach/proof.py`, `pyreach/debate.py` — Phase 5
+- `pyreach/explainer.py` — explainer for uncertain results
+  (deterministic first, one verified LLM call, never a verdict)
 - `fixtures/` — app_vuln (reachable), app_safe (not-reachable),
   app_dead (dead code), app_getattr (uncertain)
 - `examples/advisory-sample.json` — OSV-style sample for yaml.load

@@ -27,8 +27,9 @@ from .cache import Cache
 from .completeness import Ledger
 from .debate import format_pr_comment
 from .entrypoints import find_entrypoints, find_entrypoints_with_evidence
+from .explainer import explain_result, format_explanation
 from .proof import run_execution_proof
-from .reach import analyze
+from .reach import Result, analyze
 from .resolver import DEFAULT_MODEL, build_prompt, resolve_getattr_case
 from .vex import build_openvex, write_openvex
 
@@ -100,6 +101,79 @@ def main(argv=None) -> int:
                 print(f"    {c['confidence']:6} {c['qualified'] or '(no candidate)'}  {c['evidence'][:100]}")
         return 0
 
+    # Explainer command: pyreach explain --report report.json --project <path>
+    # [--target yaml.load] [--no-llm]
+    # Explains uncertain results from an existing report WITHOUT re-running
+    # the whole scan. The graph is rebuilt from the project path (in the
+    # report, or --project) so evidence packs are grounded in current code.
+    # No uncertain results -> print that plainly, exit 0.
+    if argv and argv[0] == "explain":
+        ep = argparse.ArgumentParser(
+            prog="pyreach explain",
+            description="Explain uncertain results from an existing report")
+        ep.add_argument("--report", required=True, help="report.json from a scan")
+        ep.add_argument("--project", default=None,
+                        help="Project path (default: the path stored in the report)")
+        ep.add_argument("--target", default=None,
+                        help="Only explain this vulnerable function, e.g. yaml.load")
+        ep.add_argument("--with-llm", action="store_true",
+                        help="Also run the LLM explainer layer (auto-enabled when a key is in .env)")
+        ep.add_argument("--no-llm", action="store_true",
+                        help="Deterministic explanations only, even with a key present")
+        ep.add_argument("--model", default=DEFAULT_MODEL)
+        ep.add_argument("--env-file", default=None)
+        eargs = ep.parse_args(argv[1:])
+        _report_dotenv(load_dotenv_file(path=eargs.env_file))
+        try:
+            report = json.loads(Path(eargs.report).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: cannot read report {eargs.report}: {e}", file=sys.stderr)
+            return 1
+        root = Path(eargs.project) if eargs.project else Path(report.get("project", ""))
+        if not root.exists():
+            print(f"error: project not found: {root} "
+                  f"(pass --project <path>)", file=sys.stderr)
+            return 1
+        if eargs.project and report.get("project") \
+                and Path(report["project"]) != Path(eargs.project):
+            print(f"warning: this report was for {report['project']}, "
+                  f"but you passed --project {eargs.project} — the "
+                  f"explanations are grounded in the project you passed, "
+                  f"not the one the report was scanned from")
+        use_llm = should_use_llm(eargs.with_llm, eargs.no_llm, llm_key_present())
+        if use_llm and not eargs.with_llm:
+            print("LLM: key found, explainer layer on (use --no-llm to skip it)")
+        cache = Cache(".reachcache")
+        graph = build_graph(root)
+        entries, _entry_note = find_entrypoints(root, graph)
+        adv_by_id = {a.get("id"): a for a in report.get("advisories", [])}
+        rows = [r for r in report.get("results", []) if r.get("verdict") == "uncertain"]
+        if eargs.target:
+            t = eargs.target
+            rows = [r for r in rows if r.get("vulnerable_function") in (t, )
+                    or r.get("vulnerable_function", "").endswith("." + t)
+                    or r.get("vulnerable_function", "").split(".")[-1] == t]
+        if not rows:
+            print("no uncertain results to explain.")
+            return 0
+        for r in rows:
+            adv = adv_by_id.get(r.get("advisory_id"), {}) or {}
+            res = Result(advisory_id=r.get("advisory_id", ""),
+                         package=r.get("package", ""),
+                         vulnerable_function=r.get("vulnerable_function", ""),
+                         verdict="uncertain",
+                         confidence=r.get("confidence", "low"),
+                         path=r.get("path") or [],
+                         reason=r.get("reason", ""))
+            exp = explain_result(
+                res, graph, root,
+                {"id": r.get("advisory_id", ""), "package": r.get("package", ""),
+                 "fixed_version": adv.get("fixed_version", "")},
+                entries, use_llm=use_llm, model=eargs.model, cache=cache)
+            print(format_explanation(exp))
+            print()
+        return 0
+
     p = argparse.ArgumentParser(prog="pyreach", description="Which vuln alerts actually affect this Python project?")
     p.add_argument("command", choices=["scan"])
     p.add_argument("project", help="Path to the Python project to scan")
@@ -113,6 +187,8 @@ def main(argv=None) -> int:
     p.add_argument("--model", default=DEFAULT_MODEL, help="LLM model for the resolver (default: openai/gpt-oss-20b)")
     p.add_argument("--print-prompt", action="store_true", help="Print the grounded LLM prompt for uncertain cases and exit without calling any model (demo without a key)")
     p.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
+    p.add_argument("--explain", action="store_true",
+                   help="Explain every uncertain result (deterministic first; LLM layer only if a key is present and --no-llm is not given)")
     p.add_argument("--proof-timeout", type=int, default=10, help="Seconds per witness run (default 10)")
     p.add_argument("--cache-dir", default=".reachcache")
     p.add_argument("--env-file", default=None,
@@ -278,6 +354,35 @@ def main(argv=None) -> int:
     total = len(results) or 1
     uncertain_rate = sum(1 for r in results if r.verdict == "uncertain") / total
     print(f"uncertain rate: {uncertain_rate:.0%} ({sum(1 for r in results if r.verdict == 'uncertain')}/{len(results)}) — a tool that labels everything uncertain gets 0 false not-reachable without solving anything, so report this metric.")
+
+    # Explainer: deterministic first, LLM layer only if enabled. Runs
+    # AFTER Phase 4 resolution, so explanations describe final verdicts.
+    # Never changes a verdict; the LLM output is verified before display.
+    explanations = []
+    if args.explain:
+        uncertain_results = [r for r in results if r.verdict == "uncertain"]
+        if not uncertain_results:
+            print("explain: no uncertain results to explain.")
+        for r in uncertain_results:
+            adv = next((a for a in advisories if a.id == r.advisory_id), None)
+            exp = explain_result(
+                r, graph, root,
+                {"id": r.advisory_id, "package": r.package,
+                 "fixed_version": adv.fixed_version if adv else ""},
+                entries, use_llm=use_llm, model=args.model, cache=cache)
+            explanations.append({
+                "vulnerable_function": exp["vulnerable_function"],
+                "advisory_id": exp["advisory_id"],
+                "blocker": exp["blocker"],
+                "deterministic_explanation": exp["deterministic_explanation"],
+                "llm_explanation": exp["llm_explanation"],
+                "llm_rejected": exp["llm_rejected"],
+                "discriminating_check": exp["discriminating_check"],
+                "does_not_know": exp["does_not_know"],
+                "evidence_pack_tokens": exp["evidence_pack_tokens"],
+            })
+            print()
+            print(format_explanation(exp))
     report = {
         "project": str(root),
         # Phase 3: provenance — which advisory, which fix commit, how many
@@ -301,6 +406,7 @@ def main(argv=None) -> int:
             for r in results
         ],
         "proofs": proofs,
+        "explanations": explanations,
         "pr_comments": [format_pr_comment(r, entry_note) for r in results],
     }
     Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")

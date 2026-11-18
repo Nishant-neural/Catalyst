@@ -622,6 +622,115 @@ list in Phase 5. It is what makes OpenVEX trustworthy.
 
 ---
 
+## Explainer — LLM chat explainer for UNCERTAIN results ✅ BUILT
+
+**Goal:** the real LLM use case is explaining the places deterministic
+code cannot verify — not deciding verdicts. For every uncertain result,
+pyreach first writes a deterministic explanation (works with no key),
+then optionally asks the LLM once, in a closed world, to explain the
+same evidence in plain language. The LLM output NEVER changes a verdict.
+**Files:** `pyreach/explainer.py`, CLI `--explain` / `explain` in `pyreach/cli.py`
+**Status: built and tested, 19 Nov 2026. 85 tests (was 65), verify.py offline 31/31.**
+
+Design source: research report §5 (Codex / Claude Code / Aider / Semgrep
+pattern: deterministic scanner -> LLM explainer with a narrow evidence
+pack -> human decides). Copied: closed-world JSON + deterministic
+citation verifier, ~1,500-token evidence pack, quote-first prompt with a
+mandatory `does_not_know` field, one discriminating check per blocker
+type, `[deterministic]` / `[llm-explainer]` labelling, rg evidence pass,
+conservative footer, single stateless temp-0 call. NOT copied: embeddings,
+LSP servers, persistent indexes, multi-call verification, agentic tool
+loops, auto-fix / auto-suppress.
+
+### What it does
+
+- **Blocker taxonomy, derived deterministically** (`derive_blocker()`):
+  `dynamic_call` (getattr/importlib/plugin reachable from an entry
+  point), `ambiguous_name` (same-name candidates), `unparsed_file`
+  (files ast.parse rejects), `library_not_parsed` (dependency source
+  0/0 parsed, e.g. library-internal `construct_*`). The LLM never
+  invents a blocker type — the verifier rejects any answer whose
+  blocker differs from the pack. For `dynamic_call` the blocked edge
+  is the first reachable site constant propagation cannot resolve,
+  not the first site in the file (app_getattr_mixed: line 19 config,
+  not line 15 safe literal).
+- **Deterministic explanation first, for every uncertain result:**
+  what blocks a verdict, the partial BFS path + blocked edge, what
+  would resolve it, what is not known. Labelled `[deterministic]`,
+  ends with the fixed footer: "This explanation is limited to the
+  evidence above. It does not prove the vulnerable function is (or is
+  not) called. The verdict remains UNCERTAIN."
+- **Evidence pack** (~1,500-token cap, truncate lowest-value hops
+  first): OSV advisory id/package/function/fixed version, partial BFS
+  path with file:line per hop, the single blocked edge + blocker,
+  <=30 lines of snippet per hop (function body only), a symbol table
+  for ambiguous names, capped rg matches. Never the whole repo, whole
+  call graph, or unparsed library source — those are "not parsed".
+- **Ripgrep pass before any LLM call** (`ripgrep_evidence()`): `rg -n`
+  over the analysed tree, top 20 matches, with a Python os.walk +
+  regex fallback when rg is absent.
+- **Closed-world JSON schema:** `{blocker, what_blocks, evidence:
+  [{file, line, snippet}], what_would_resolve: [{check, command}],
+  does_not_know: [...], verdict: "uncertain"}` — the verdict enum has
+  ONE allowed value. **Deterministic citation verifier**
+  (`verify_explainer_answer()`): JSON parses; verdict exactly
+  "uncertain" (reachable/not_reachable in any verdict field fails);
+  blocker matches the pack; does_not_know present and non-empty;
+  every cited file:line exists in the analysed tree AND inside the
+  pack; every snippet is a verbatim substring of that file at that
+  line (whitespace-normalised). Any failure rejects the whole answer:
+  fall back to deterministic only, `llm_rejected: true`.
+- **One discriminating check per blocker type** (deterministic template
+  in code, LLM fills in nothing): dynamic_call -> `rg` for the literal
+  name + log at file:line and run the entry point; ambiguous_name ->
+  `rg "def <name>"` + confirm the import; unparsed_file -> `python -m
+  py_compile <file>` + fix and re-run; library_not_parsed -> `pip show
+  <pkg>` + check the installed source. The file:line is verified to
+  exist before display.
+- **One stateless call, temp 0, no tools, no loop**, via the existing
+  `resolver.resolve_with_llm` (same cache, same .env/key handling).
+  No key / timeout / rejected answer -> print the deterministic
+  explanation alone with "[llm-explainer unavailable — deterministic
+  result unchanged]". `--no-llm` gives deterministic only.
+
+### Commands
+
+```bash
+pyreach scan fixtures/app_getattr_config --advisory examples/advisory-sample.json --explain --no-llm
+# report.json gains "explanations": [{vulnerable_function, blocker,
+# deterministic_explanation, llm_explanation or null, llm_rejected,
+# discriminating_check, does_not_know, evidence_pack_tokens}]
+pyreach explain --report report.json --project fixtures/app_getattr_config --no-llm
+# same explanations from an existing report, without re-scanning.
+# No uncertain results -> "no uncertain results to explain.", exit 0.
+# --project different from the report's project prints a warning.
+```
+
+Live output on app_getattr_config (deterministic only): blocker
+`dynamic_call` at app.py:10, name comes from `config["func"]`,
+does_not_know lists what `config["func"]` is at runtime. On
+app_getattr_mixed the blocked edge is line 19 (config), not line 15
+(safe literal).
+
+### Honest limits
+
+- The LLM layer has never run with a real key in this repo (same as
+  Phase 4): the prompt, schema, and verifier are tested with stubbed
+  answers only. A real run may still be rejected by the verifier —
+  that is the safe outcome, not a failure.
+- The fallback blocker label is imperfect for the low-confidence
+  case: if a result is uncertain only because the function list is
+  low confidence (no dynamic / ambiguous / unparsed / internal
+  cause), it is labelled `library_not_parsed`. The explanation text
+  says so plainly instead of inventing a cause.
+- `explain` trusts the report's verdicts and rebuilds the graph from
+  the project you pass; a mismatched project prints a warning but
+  still explains (grounded in the wrong graph — check the warning).
+- `--explain` has not yet been run on the three real projects
+  (MkDocs / Cookiecutter / pre-commit); their uncertain results are
+  mostly ambiguous/library blockers, which the templates cover, but
+  the token cap has only been exercised on fixtures so far.
+
 ## Phase 6 (stretch) — Taint priority — KEEP FOR LATER
 
 **Do not build this in Phases 1-5. Come back only if time is left.**

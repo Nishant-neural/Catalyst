@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 65 unit tests + 26 fixture scans + prompt + witness
+python verify.py            # offline: 85 unit tests + 26 fixture scans + prompt + witness + explain
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,12 +39,14 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 65 tests run with stdlib unittest:
+# if pytest is not installed, the same 85 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 
-Expect: **65 passed**. These cover the call graph, the verifier's 10 rules,
-constant propagation, the witness, and the debate rule. (`verify.py` tries
+Expect: **85 passed**. These cover the call graph, the verifier's 10 rules,
+constant propagation, the witness, the debate rule, and the explainer
+(20 tests: citation verifier, evidence-pack caps, all four blocker
+templates, LLM unavailable / rejected / accepted). (`verify.py` tries
 pytest first and falls back to unittest on its own.)
 
 ### 2. Fixture scans — expected verdicts (sample advisory, no network)
@@ -131,7 +133,39 @@ Expect: the wrapper trace reads
 `entry_mod.main -> helpers.parse_config -> yaml.load`; the args fixture
 records a TypeError and keeps the verdict reachable.
 
-### 5. Live test — the real advisory pipeline (needs network)
+### 5. Explainer — uncertain results, no key needed
+
+```bash
+# Deterministic explanations only (no LLM call at all):
+python3 -m pyreach.cli scan fixtures/app_getattr_config \
+  --advisory examples/advisory-sample.json --explain --no-llm --out /tmp/report.json
+python3 -m pyreach.cli explain --report /tmp/report.json \
+  --project fixtures/app_getattr_config --no-llm
+```
+
+Expect on app_getattr_config: blocker `dynamic_call` at app.py:10,
+the name comes from `config["func"]`, `does_not_know` lists what
+`config["func"]` is at runtime, the deterministic explanation ends
+with "The verdict remains UNCERTAIN.", `llm_explanation` is null and
+`llm_rejected` is false, and the report's `explanations` list has one
+entry. `report.json` records `evidence_pack_tokens` (385 on this
+fixture — well under the ~1,500 cap).
+
+On app_getattr_mixed the blocked edge must be line 19 (the config
+site), not line 15 (the safe literal `"safe_load"` — already decided).
+On app_vuln `--explain` prints "no uncertain results to explain"
+and the report's `explanations` list is empty.
+
+With a key in `.env`, a plain `--explain` scan also runs the LLM
+layer (same auto-enable as Phase 4; `--no-llm` turns it off). The
+LLM answer is accepted only if its verdict is exactly `"uncertain"`,
+its blocker matches the deterministic one, and every cited snippet
+matches the code verbatim — otherwise `llm_rejected` is true and
+only the deterministic explanation is shown. The LLM layer has never
+run with a real key in this repo; if you run it and it is rejected,
+that is the safe outcome, not a failure.
+
+### 6. Live test — the real advisory pipeline (needs network)
 
 ```bash
 python3 -m pyreach.cli fetch PyYAML 5.3.1 --out /tmp/advisories.json

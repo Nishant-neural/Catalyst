@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""One-command verification for pyreach, Phases 1-5.
+"""One-command verification for pyreach, Phases 1-5 + explainer.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness
+    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness + explain
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (65 tests) — the deterministic core
+  A. the unit suite (85 tests) — the deterministic core + explainer
   B. all 26 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
      and never downgrades when the entry needs args (Phase 5)
-  E. (--live) the real OSV -> fix-commit -> candidates pipeline
+  E. --explain explains uncertain results deterministically, with the
+     footer, and `explain` replays them from an existing report
+  F. (--live) the real OSV -> fix-commit -> candidates pipeline
      for PyYAML 5.3.1, the case Phase 1 was built on
 """
 from __future__ import annotations
@@ -113,15 +115,15 @@ def main() -> int:
 
     print("A. unit tests")
     # pytest if present, else stdlib unittest (the tests are unittest
-    # TestCases, so both run the same 65 tests). pytest is not part of
+    # TestCases, so both run the same 85 tests). pytest is not part of
     # a default Python install, and a fresh VM may not have it.
     r = run(["-m", "pytest", "tests", "-q"])
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (65 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (85 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (65 tests)", r.returncode == 0,
+        check("pytest suite (85 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -174,8 +176,37 @@ def main() -> int:
           and "TypeError" in str(proof.get("error")),
           f"verdict={verdict} proof={proof}")
 
+    print("E. explainer --explain (deterministic only, no key needed)")
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_getattr_config",
+             "--advisory", ADV, "--explain", "--no-llm",
+             "--out", str(tmp / "e.json"), "--cache-dir", str(tmp / "cache")])
+    rep = _read_report(tmp / "e.json")
+    exps = (rep or {}).get("explanations", []) if rep else []
+    check("scan --explain: 1 explanation, dynamic_call, footer, no LLM",
+          len(exps) == 1 and exps[0]["blocker"] == "dynamic_call"
+          and "verdict remains UNCERTAIN" in exps[0]["deterministic_explanation"]
+          and 'config["func"]' in exps[0]["deterministic_explanation"]
+          and exps[0]["llm_explanation"] is None
+          and exps[0]["llm_rejected"] is False
+          and exps[0]["does_not_know"]
+          and exps[0]["evidence_pack_tokens"] <= 1500
+          and r.returncode == 0,
+          f"explanations={exps} exit={r.returncode}")
+    r = run(["-m", "pyreach.cli", "explain", "--report", str(tmp / "e.json"),
+             "--project", "fixtures/app_getattr_config", "--no-llm"])
+    check("explain replays from the report without re-scanning",
+          "Blocker: dynamic_call" in r.stdout and r.returncode == 0,
+          r.stdout[-200:] + r.stderr[-200:])
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_vuln",
+             "--advisory", ADV, "--explain", "--no-llm",
+             "--out", str(tmp / "e2.json"), "--cache-dir", str(tmp / "cache")])
+    rep = _read_report(tmp / "e2.json")
+    check("scan --explain with no uncertain results: empty list, exit 2",
+          (rep or {}).get("explanations") == [] and r.returncode == 2,
+          f"explanations={(rep or {}).get('explanations')} exit={r.returncode}")
+
     if live:
-        print("E. live OSV fetch (network)")
+        print("F. live OSV fetch (network)")
         out = tmp / "live-advisories.json"
         r = run(["-m", "pyreach.cli", "fetch", "PyYAML", "5.3.1",
                  "--out", str(out)])
