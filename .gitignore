@@ -5,4 +5,9 @@ report.json
 openvex.json
 .venv/
 *.egg-info/
+# API keys live here. .env is NEVER committed; .env.example is the
+# template (no real key in it). If you ever commit a real key by
+# mistake, revoke it at openrouter.ai/keys and make a new one.
 .env
+_live_advisories.json
+advisories.json

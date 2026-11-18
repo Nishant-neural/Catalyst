@@ -14,9 +14,12 @@ pyreach scan fixtures/app_safe --advisory examples/advisory-sample.json --out re
 pyreach scan fixtures/app_dead --advisory examples/advisory-sample.json --out report.json --vex openvex.json
 pyreach scan fixtures/app_getattr --advisory examples/advisory-sample.json --out report.json --vex openvex.json
 
-# Phase 4, only if you have a free key:
-export OPENROUTER_API_KEY=...
-pyreach scan fixtures/app_getattr --advisory examples/advisory-sample.json --with-llm --out report.json
+# Phase 4, only if you have a free key — put it in .env, pyreach loads
+# it AND turns the LLM on by itself, no flag needed:
+#   Copy-Item .env.example .env   (PowerShell) / cp .env.example .env
+#   then edit .env: OPENROUTER_API_KEY=sk-or-v1-...  (never commit .env)
+pyreach scan fixtures/app_getattr --advisory examples/advisory-sample.json --out report.json
+# (use --no-llm to skip the LLM even with a key in .env)
 
 # Phase 5, execution proof:
 pyreach scan fixtures/app_vuln --advisory examples/advisory-sample.json --with-proof --out report.json
@@ -76,6 +79,9 @@ unknown — do not accuse anyone, just do not follow it.
 - `pyreach/callgraph.py`, `pyreach/reach.py` — Phase 2
 - `pyreach/entrypoints.py`, `pyreach/vex.py`, `pyreach/cache.py`, `pyreach/cli.py` — Phase 3
 - `pyreach/resolver.py` — Phase 4
+- `pyreach/dotenv.py` — .env loader for the API key (stdlib only, no
+  new dependency; real env vars always win over .env; the key value
+  is never printed or written into a report). See `.env.example`.
 - `pyreach/proof.py`, `pyreach/debate.py` — Phase 5
 - `fixtures/` — app_vuln (reachable), app_safe (not-reachable),
   app_dead (dead code), app_getattr (uncertain)

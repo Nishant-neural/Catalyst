@@ -42,8 +42,13 @@ ROUTE_DECORATORS = (
 
 def _resolve_simple(graph: Graph, name: str, prefer_module: str | None = None) -> str | None:
     """Resolve a simple function name to a qualified function.
-    Prefer `prefer_module` (e.g. views), then same-module, then unique."""
-    cands = [q for q in graph.functions if q.split(".")[-1] == name]
+    Prefer `prefer_module` (e.g. views), then same-module, then unique.
+    External library functions (file="external", e.g. yaml.load) are
+    never candidates: a console_script or route pointing at "load"
+    must resolve to a project function, not to the library it calls."""
+    cands = [q for q in graph.functions
+             if q.split(".")[-1] == name
+             and graph.functions[q].file != "external"]
     if not cands:
         return None
     if prefer_module:
@@ -244,6 +249,14 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
             if lib_entries:
                 return lib_entries, "library: __all__ is the entry surface"
         for q in graph.functions:
+            # External library functions are NOT entries. Bug found
+            # 19 Nov 2026 by scanning real MkDocs: yaml.load, os.path.join
+            # and every other external node were added as library entries,
+            # so BFS found yaml.load as its own entry with path
+            # ["yaml.load"] — a reachable verdict with no real evidence
+            # chain. An entry point must be project code that runs.
+            if graph.functions[q].file == "external":
+                continue
             if not q.split(".")[-1].startswith("_"):
                 # Only if module is public (not _private)
                 if "._" not in q:
@@ -251,7 +264,10 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
         # Library mode is broader by design; note it in the reason string.
         return entries, "library: public API is the entry surface"
     if not entries:
-        # Fallback: public functions only, low confidence
-        entries = {q for q in graph.functions if not q.split(".")[-1].startswith("_")}
+        # Fallback: public functions only, low confidence — project
+        # functions only, never external library nodes (same bug).
+        entries = {q for q in graph.functions
+                   if not q.split(".")[-1].startswith("_")
+                   and graph.functions[q].file != "external"}
         return entries, "fallback: no main/route found, used public functions only"
     return entries, f"app: {len(entries)} entry point(s)"

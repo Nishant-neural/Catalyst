@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 48 unit tests + 24 fixture scans + prompt + witness
+python verify.py            # offline: 65 unit tests + 26 fixture scans + prompt + witness
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,11 +39,11 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 48 tests run with stdlib unittest:
+# if pytest is not installed, the same 65 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 
-Expect: **48 passed**. These cover the call graph, the verifier's 10 rules,
+Expect: **65 passed**. These cover the call graph, the verifier's 10 rules,
 constant propagation, the witness, and the debate rule. (`verify.py` tries
 pytest first and falls back to unittest on its own.)
 
@@ -94,13 +94,25 @@ python3 -m pyreach.cli scan fixtures/app_getattr_config \
 Check the prompt lists only functions from that one file (same-file
 candidates), the string literals, and the vulnerable function.
 
-With a key (OpenRouter or Groq, free tier), the LLM path runs:
+With a key (OpenRouter or Groq, free tier), the LLM path runs — put
+the key in `.env` in the project root (see "The LLM" below) and run
+a plain scan, no flag at all. A key in `.env` IS the request to use
+the LLM:
 
 ```bash
-export OPENROUTER_API_KEY=...
 python3 -m pyreach.cli scan fixtures/app_getattr_config \
-  --advisory examples/advisory-sample.json --with-llm
+  --advisory examples/advisory-sample.json
 ```
+
+You should see two lines at the top:
+`.env: loaded 1 key(s) from .../.env (OPENROUTER_API_KEY)` and
+`LLM: key found via .env, resolver on (use --no-llm to skip it)`.
+If you see no `.env:` line, there is no `.env` file where pyreach
+looked, or the key is already set as a real env var (which wins over
+`.env`). `--with-llm` still works as an explicit flag, and `--no-llm`
+turns the resolver off even with a key present. `report.json` also
+records `"llm_enabled": true/false`, so you can check after the run
+whether the LLM was actually on.
 
 Expect it to **stay uncertain** — the name comes from config, and a good
 answer there is "unknown". If it ever flips that fixture to not_reachable,
@@ -198,10 +210,12 @@ witness runs one subprocess per reachable result.
 ## The LLM — do you need it, and where the key goes
 
 **No, not for the core workflow.** Phases 1, 2, 3 and 5 run with no LLM
-and no key. The LLM only runs when you pass `--with-llm`, and only for
-results that are still uncertain after constant propagation — it is the
-last resort for dynamic cases, never the decider (the 10-rule verifier
-decides, and a failed verification stays uncertain).
+and no key. The LLM runs only for results that are still uncertain
+after constant propagation — it is the last resort for dynamic cases,
+never the decider (the 10-rule verifier decides, and a failed
+verification stays uncertain). It turns on by itself when a key is in
+`.env` or the environment; `--with-llm` is the explicit way to ask
+for it, `--no-llm` turns it off even with a key present.
 
 To enable it, get a free key from OpenRouter:
 
@@ -211,8 +225,28 @@ To enable it, get a free key from OpenRouter:
 2. Use the free model id `openai/gpt-oss-20b:free` (the `:free` suffix
    matters: without it, it is the paid variant). Free tier is
    rate-limited, roughly tens to a couple hundred requests a day.
-3. Put the key in an environment variable, never in code or a file
-   you commit. PowerShell, this session only:
+3. Put the key in a `.env` file in the project root — this is the
+   easiest way, and pyreach loads it automatically on every `scan`
+   and `fetch` (no extra flag, no new dependency, stdlib parser in
+   `pyreach/dotenv.py`):
+   ```powershell
+   Copy-Item .env.example .env
+   # then open .env in Notepad and replace sk-or-v1-paste-your-key-here
+   # with your real key. One line, no quotes, no spaces around the =:
+   #   OPENROUTER_API_KEY=sk-or-v1-...
+   ```
+   On Linux/macOS: `cp .env.example .env`, then edit the same line.
+   `.env` is in `.gitignore` — never commit it. If a key ever leaks
+   into git, revoke it at openrouter.ai/keys and make a new one.
+   pyreach prints `.env: loaded 1 key(s) from .../.env
+   (OPENROUTER_API_KEY)` — the key value itself is never printed,
+   logged, or written into report.json / openvex.json.
+   A `.env` in the scanned project's folder also works, and
+   `--env-file <path>` points at a `.env` somewhere else.
+   A real environment variable always wins over `.env`: if
+   `OPENROUTER_API_KEY` is already set, the `.env` value is ignored
+   for that key (pyreach says so on the `.env:` line).
+   The old way still works too — PowerShell, this session only:
    ```powershell
    $env:OPENROUTER_API_KEY='sk-or-v1-...'
    ```
@@ -221,10 +255,11 @@ To enable it, get a free key from OpenRouter:
    [System.Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-v1-...','User')
    ```
    On Linux/macOS: `export OPENROUTER_API_KEY='sk-or-v1-...'`.
-4. Run it:
+4. Run it — plain scan, no flag (the `.env` key turns the resolver
+   on by itself):
    ```bash
    python -m pyreach.cli scan fixtures/app_getattr_config \
-     --advisory examples/advisory-sample.json --with-llm \
+     --advisory examples/advisory-sample.json \
      --model openai/gpt-oss-20b:free
    ```
    Expect `app_getattr_config` to **stay uncertain** — its name comes

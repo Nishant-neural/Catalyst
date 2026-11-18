@@ -53,6 +53,36 @@ class TestEntryPointsPhase3(unittest.TestCase):
         self.assertEqual(res["yaml.load"].verdict, "reachable")
         self.assertIn("pkg.lib.load_config", res["yaml.load"].path)
 
+    def test_external_library_functions_are_never_entries(self):
+        # Regression, 19 Nov 2026 (real MkDocs scan): in library mode
+        # every external node — yaml.load, os.path.join, ... — was added
+        # as an entry, so BFS returned path ["yaml.load"] for a
+        # reachable verdict with no real evidence chain. Build a tiny
+        # library in a temp dir: yaml.load must NOT be an entry, and
+        # the path must go through the project's own load_config.
+        import tempfile
+        import textwrap
+        tmp = Path(tempfile.mkdtemp(prefix="pyreach-lib-"))
+        (tmp / "pyproject.toml").write_text(
+            '[project]\nname = "demo"\nversion = "0.1.0"\n', encoding="utf-8")
+        pkg = tmp / "pkg"
+        pkg.mkdir()
+        (pkg / "__init__.py").write_text("", encoding="utf-8")
+        (pkg / "core.py").write_text(textwrap.dedent("""\
+            import yaml
+            def load_config(path):
+                with open(path) as f:
+                    return yaml.load(f)
+            """), encoding="utf-8")
+        graph = build_graph(tmp)
+        entries, note = find_entrypoints(tmp, graph)
+        self.assertNotIn("yaml.load", entries)
+        self.assertIn("pkg.core.load_config", entries)
+        results = analyze(ADV, graph, entries)
+        res = {r.vulnerable_function: r for r in results}["yaml.load"]
+        self.assertEqual(res.verdict, "reachable")
+        self.assertEqual(res.path, ["pkg.core.load_config", "yaml.load"])
+
     def test_click_command_still_works(self):
         graph, entries, note, res = scan("app_click")
         self.assertEqual(entries, {"app.cli"})

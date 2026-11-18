@@ -276,6 +276,10 @@ def build_graph(root: str | Path) -> Graph:
     star_modules: dict[str, set[str]] = {}
     for f, mods in star_by_file.items():
         star_modules[f] = set(mods)
+    # Top-level packages defined in this project (mkdocs, cookiecutter,
+    # ...). A dotted call whose base is NOT one of these cannot be a
+    # project function — it is a library call like yaml.load.
+    project_tops = {q.split(".")[0] for q in graph.functions}
     for call in graph.raw_calls:
         if call["kind"] == "dynamic":
             continue
@@ -283,6 +287,25 @@ def build_graph(root: str | Path) -> Graph:
         caller = call["caller"]
         kind = call["kind"]
         if raw in graph.functions:
+            graph.edges.setdefault(caller, set()).add(raw)
+            continue
+        # Dotted library call FIRST, before simple-name fallback.
+        # Bug found 19 Nov 2026 by scanning real MkDocs: `yaml.load`
+        # was resolved to `FakeEntryPoint.load` — a test fake — because
+        # the simple-name fallback below ran first and "load" matched
+        # exactly one project function, in a different module. A dotted
+        # call names its module explicitly: yaml.load cannot be
+        # FakeEntryPoint.load. The same-name fallback is only for bare
+        # / unresolved-object calls, never for a dotted import call.
+        # Guard: if the base IS a project top-level package, this could
+        # be a project function (e.g. self.load resolved to
+        # mkdocs...load), so fall through to the normal resolution.
+        if ("." in raw and kind in ("attr", "direct")
+                and raw.split(".")[0] not in project_tops):
+            graph.functions[raw] = FuncInfo(
+                qualified=raw, file="external", start=0, end=0,
+                name=raw.split(".")[-1],
+            )
             graph.edges.setdefault(caller, set()).add(raw)
             continue
         simple = raw.split(".")[-1]

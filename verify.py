@@ -2,15 +2,15 @@
 """One-command verification for pyreach, Phases 1-5.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 25 fixture scans + prompt + witness
+    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (48 tests) — the deterministic core
-  B. all 24 fixtures give the expected verdict AND exit code
+  A. the unit suite (65 tests) — the deterministic core
+  B. all 26 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
@@ -56,6 +56,7 @@ EXPECTED = {
     "app_witness_wrapper": ("reachable", 2),
     "app_proof_args": ("reachable", 2),
     "app_getattr_mixed": ("uncertain", 0),
+    "app_load_collision": ("reachable", 2),
 }
 
 passed = failed = 0
@@ -112,15 +113,15 @@ def main() -> int:
 
     print("A. unit tests")
     # pytest if present, else stdlib unittest (the tests are unittest
-    # TestCases, so both run the same 48 tests). pytest is not part of
+    # TestCases, so both run the same 65 tests). pytest is not part of
     # a default Python install, and a fresh VM may not have it.
     r = run(["-m", "pytest", "tests", "-q"])
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (48 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (65 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (48 tests)", r.returncode == 0,
+        check("pytest suite (65 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")

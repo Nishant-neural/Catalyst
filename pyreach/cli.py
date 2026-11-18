@@ -4,7 +4,8 @@ Phases 1-5 in one command:
   1. advisory -> vulnerable functions
   2. call graph + BFS reachability
   3. real entry points + JSON + OpenVEX + cache
-  4. LLM resolver for uncertain dynamic cases (only with a key)
+  4. LLM resolver for uncertain dynamic cases (auto-enabled when a key
+     is in .env / the environment, --no-llm to skip it)
   5. execution proof for reachable cases + PR comment
 
 Exit 0 = scan completed (even if reachable found).
@@ -14,10 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
 from .advisory import load_advisories
+from .dotenv import load_dotenv_file
 from .phase1 import analyse_advisory_live, save_advisories
 from .callgraph import build_graph
 from .cache import Cache
@@ -30,6 +33,45 @@ from .resolver import DEFAULT_MODEL, build_prompt, resolve_getattr_case
 from .vex import build_openvex, write_openvex
 
 
+def _report_dotenv(summary: dict) -> None:
+    """One line about .env loading. Never prints a value — only the file
+    path, how many keys were loaded, and how many were already set in
+    the real environment (those win and are left untouched). Silent
+    when there is no .env file at all: that is the normal no-key case."""
+    if not summary.get("path"):
+        return
+    if summary.get("error"):
+        print(f".env: {summary['error']} (continuing with environment variables)")
+        return
+    loaded, skipped = summary["loaded"], summary["skipped"]
+    if loaded:
+        print(f".env: loaded {len(loaded)} key(s) from {summary['path']} ({', '.join(loaded)})")
+    if skipped:
+        print(f".env: {len(skipped)} key(s) already set in the environment, kept as-is ({', '.join(skipped)})")
+
+
+def llm_key_present() -> bool:
+    """Is there an LLM key to use — from .env (already loaded by now)
+    or from a real environment variable? Checks the value's presence
+    only, never the value itself."""
+    return bool(os.environ.get("OPENROUTER_API_KEY")
+                or os.environ.get("GROQ_API_KEY"))
+
+
+def should_use_llm(with_llm: bool, no_llm: bool, key_present: bool) -> bool:
+    """Decide whether the Phase 4 LLM resolver may run.
+
+    --no-llm always wins (explicit opt-out). Otherwise the resolver is
+    on when the user asked for it (--with-llm) OR when a key is present
+    — that is the .env case: putting a key in .env is itself asking for
+    the LLM, so a plain `scan` must use it with no extra flag. With no
+    key at all the resolver stays off and verdicts stay uncertain.
+    """
+    if no_llm:
+        return False
+    return bool(with_llm or key_present)
+
+
 def main(argv=None) -> int:
     # Phase 1 fetch command: pyreach fetch <package> <version> [--out advisories.json]
     # Lives before the scan parser, so `fetch` does not need a project path.
@@ -40,7 +82,10 @@ def main(argv=None) -> int:
         fp.add_argument("package")
         fp.add_argument("version")
         fp.add_argument("--out", default="advisories.json")
+        fp.add_argument("--env-file", default=None,
+                        help=".env file to load the API key from (default: ./.env if present)")
         fargs = fp.parse_args(argv[1:])
+        _report_dotenv(load_dotenv_file(path=fargs.env_file))
         print(f"fetching OSV for {fargs.package} {fargs.version} ...")
         # Phase 3: diffs are cached by commit sha / sdist sha256, so a
         # second fetch of the same advisory is a cache hit, not a download.
@@ -63,18 +108,37 @@ def main(argv=None) -> int:
     p.add_argument("--version", help="Installed version to fetch advisories for, e.g. 5.3.1")
     p.add_argument("--out", default="report.json", help="JSON report output")
     p.add_argument("--vex", default="openvex.json", help="OpenVEX output (only for not_reachable)")
-    p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (needs OPENROUTER_API_KEY)")
+    p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (also auto-enabled when a key is in .env / the environment)")
+    p.add_argument("--no-llm", action="store_true", help="Never run the LLM resolver, even if a key is in .env / the environment")
     p.add_argument("--model", default=DEFAULT_MODEL, help="LLM model for the resolver (default: openai/gpt-oss-20b)")
     p.add_argument("--print-prompt", action="store_true", help="Print the grounded LLM prompt for uncertain cases and exit without calling any model (demo without a key)")
     p.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
     p.add_argument("--proof-timeout", type=int, default=10, help="Seconds per witness run (default 10)")
     p.add_argument("--cache-dir", default=".reachcache")
+    p.add_argument("--env-file", default=None,
+                   help=".env file to load the API key from (default: ./.env in the current dir or the scanned project)")
     args = p.parse_args(argv)
 
     root = Path(args.project)
     if not root.exists():
         print(f"error: project not found: {root}", file=sys.stderr)
         return 1
+
+    # .env first, before anything reads OPENROUTER_API_KEY / GROQ_API_KEY.
+    # A real env var always wins; a missing .env is silent and normal.
+    dotenv_summary = load_dotenv_file(path=args.env_file, project=root)
+    _report_dotenv(dotenv_summary)
+
+    # The .env case: a key in .env IS the request to use the LLM, so a
+    # plain `scan` (no --with-llm) uses it. --no-llm always wins.
+    use_llm = should_use_llm(args.with_llm, args.no_llm, llm_key_present())
+    if use_llm and not args.with_llm:
+        via = ".env" if any(k in dotenv_summary.get("loaded", [])
+                            for k in ("OPENROUTER_API_KEY", "GROQ_API_KEY")) else "the environment"
+        print(f"LLM: key found via {via}, resolver on (use --no-llm to skip it)")
+    elif args.with_llm and not llm_key_present():
+        print("LLM: --with-llm passed but no key found — put it in .env "
+              "(OPENROUTER_API_KEY=...) and re-run; staying uncertain for now")
 
     cache = Cache(args.cache_dir)
     if args.advisory:
@@ -151,11 +215,11 @@ def main(argv=None) -> int:
                     print(build_prompt(snippet, same_file, extract_string_literals(src),
                                        [r.vulnerable_function], d["file"], d["line"]))
                     print(f"# ... and {len(sites) - 1} more dynamic sites "
-                          f"(run with --with-llm to resolve them all)")
+                          f"(a key in .env enables the resolver for them all)")
                 continue
             outcome = resolve_getattr_case(
                 src, d["line"], [r.vulnerable_function], set(graph.functions),
-                cache=cache, model=args.model, allow_llm=args.with_llm)
+                cache=cache, model=args.model, allow_llm=use_llm)
             if outcome is None:
                 unresolved += 1
                 continue
@@ -226,6 +290,7 @@ def main(argv=None) -> int:
         ],
         "entry_note": entry_note,
         "entry_evidence": evidence,
+        "llm_enabled": use_llm,
         "completeness_ledger": ledger.to_dict(),
         "uncertain_rate": uncertain_rate,
         "cache": {"hits": cache.hits, "misses": cache.misses},

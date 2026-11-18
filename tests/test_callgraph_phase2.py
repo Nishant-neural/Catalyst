@@ -56,6 +56,17 @@ class TestPhase2Fixtures(unittest.TestCase):
         graph, entries, res = scan("app_alias")
         self.assertEqual(res["yaml.load"].verdict, "reachable")
 
+    def test_dotted_library_call_beats_same_simple_name(self):
+        # Regression, 19 Nov 2026 (real MkDocs scan): yaml.load was
+        # resolved to FakeEntryPoint.load — the only project function
+        # whose simple name is "load" — and yaml.load was never
+        # reachable. A dotted import call names its module explicitly.
+        graph, _, res = scan("app_load_collision")
+        self.assertEqual(res["yaml.load"].verdict, "reachable")
+        self.assertIn("app.main", res["yaml.load"].path)
+        self.assertNotIn("app.FakeEntryPoint.load", res["yaml.load"].path)
+        self.assertIn("yaml.load", graph.edges.get("app.main", set()))
+
     def test_no_external_node_for_local_variable_call(self):
         # app_method has Loader().load_config() — a call on a Call node.
         # Its base must not become an external 'Loader' node, and

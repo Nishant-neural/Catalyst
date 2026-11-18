@@ -434,6 +434,37 @@ If any rule fails, discard the LLM answer and stay uncertain.
 If no API key is set (`OPENROUTER_API_KEY` / `GROQ_API_KEY`), the
 resolver is skipped entirely and verdicts stay uncertain. That is safe.
 
+### .env — where the key lives (19 Nov 2026)
+
+`pyreach/dotenv.py` (stdlib only, no python-dotenv dependency) loads
+the key from a `.env` file: `Copy-Item .env.example .env`, then one
+line `OPENROUTER_API_KEY=sk-or-v1-...`. The CLI loads it at the start
+of every `scan` and `fetch` (also `--env-file <path>`; the resolver
+loads it as a fallback for library callers), looking in the current
+directory (walking up), then the scanned project's directory.
+Only `OPENROUTER_API_KEY`, `GROQ_API_KEY` and `LLM_BASE_URL` are ever
+read — any other line is ignored, so a stray line cannot inject an
+unrelated env var. A real environment variable always wins over
+`.env`; a missing `.env` is silent and normal. The loader prints
+only the file path and how many keys were loaded, never a value, and
+`.env` is in `.gitignore` (`.env.example` is the template, no real
+key in it). Verified 19 Nov 2026: 10 new tests in
+`tests/test_dotenv.py` (59 tests total), plus an end-to-end scan with
+a fake key in `.env` — the `.env:` line printed, the scan stayed
+uncertain on app_getattr_config as it should, and the fake key
+appeared nowhere in stdout, report.json or openvex.json.
+
+**Auto-enable, 19 Nov 2026:** a key in `.env` IS the request to use
+the LLM, so a plain `scan` (no `--with-llm`) now turns the resolver
+on — `cli.should_use_llm()`: `--no-llm` always wins, otherwise
+`--with-llm` or a present key enables it. The scan prints
+`LLM: key found via .env, resolver on (use --no-llm to skip it)` and
+records `"llm_enabled": true/false` in report.json, so you can check
+afterwards whether the LLM was actually on. `--with-llm` still works;
+with no key anywhere the resolver stays off. Verified with a fake
+key: plain scan -> `llm_enabled: true`, `--no-llm` -> false, no `.env`
+-> false. 63 tests total (4 new in `tests/test_llm_auto.py`).
+
 ### ✅ What Phase 4 actually built (23 Nov 2026, live-verified)
 
 - `constant_propagate_getattr()` rewritten: source order (ast.walk is
@@ -476,6 +507,19 @@ resolver is skipped entirely and verdicts stay uncertain. That is safe.
 - Honest limits: no variable type inference (unchanged), no LLM run
   yet — the resolver needs OPENROUTER_API_KEY / GROQ_API_KEY and the
   0.8 threshold is still untested against organisers' fixtures.
+- **Real-project tests, 19 Nov 2026 (see REAL_PROJECTS.md):**
+  MkDocs (65 py) 4 reachable / 3 uncertain, exit 2, path
+  `mkdocs.utils.meta.get_data -> yaml.load`; Cookiecutter (90 py)
+  and pre-commit (134 py) 7/7 uncertain, exit 0. Two bugs found and
+  fixed: (1) `yaml.load` mis-resolved to a test fake's `.load` by
+  simple-name fallback — dotted library calls now resolve before
+  that fallback (`fixtures/app_load_collision`); (2) external
+  library functions were library-mode entry points, giving a bogus
+  path `["yaml.load"]` — entries are project code only now.
+  65 tests, verify.py offline 30/30. Still open: no real project
+  reaches not_reachable (library internals 0/0 parsed + ambiguous
+  edges block it), `functools.partial` wrappers are invisible, and
+  the Loader argument is not distinguished.
 
 ### Design Question 2 — answer
 

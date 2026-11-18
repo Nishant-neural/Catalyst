@@ -255,7 +255,9 @@ def resolve_with_llm(prompt: str, api_key: str | None = None,
                      model: str = DEFAULT_MODEL, cache=None) -> dict | None:
     """Call a free OpenRouter-compatible endpoint. Returns parsed JSON or None.
 
-    Set OPENROUTER_API_KEY or GROQ_API_KEY. No key -> None (stay uncertain).
+    Set OPENROUTER_API_KEY or GROQ_API_KEY — as a real env var, or in a
+    .env file in the current directory (see pyreach/dotenv.py). No key
+    -> None (stay uncertain).
     This function is intentionally small; swap the endpoint in one place.
     Phase 4: answers are cached by (model, sha256(prompt)) in the same
     .reachcache as Phase 3, so a re-scan does not re-spend an LLM call.
@@ -268,6 +270,13 @@ def resolve_with_llm(prompt: str, api_key: str | None = None,
         if hit is not None:
             return hit.get("answer")
     key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY")
+    if not key:
+        # Library callers bypass cli.py, so try ./.env here too. This is
+        # a no-op when there is no .env file, and it never overrides a
+        # real env var. The CLI already loaded it; loading twice is safe.
+        from .dotenv import load_dotenv_file
+        load_dotenv_file()
+        key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not key:
         return None
     try:
