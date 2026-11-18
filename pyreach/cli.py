@@ -26,7 +26,7 @@ from .debate import format_pr_comment
 from .entrypoints import find_entrypoints, find_entrypoints_with_evidence
 from .proof import run_execution_proof
 from .reach import analyze
-from .resolver import build_prompt, constant_propagate_getattr, extract_string_literals, resolve_with_llm, verify_answer
+from .resolver import DEFAULT_MODEL, build_prompt, resolve_getattr_case
 from .vex import build_openvex, write_openvex
 
 
@@ -64,7 +64,10 @@ def main(argv=None) -> int:
     p.add_argument("--out", default="report.json", help="JSON report output")
     p.add_argument("--vex", default="openvex.json", help="OpenVEX output (only for not_reachable)")
     p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (needs OPENROUTER_API_KEY)")
+    p.add_argument("--model", default=DEFAULT_MODEL, help="LLM model for the resolver (default: openai/gpt-oss-20b)")
+    p.add_argument("--print-prompt", action="store_true", help="Print the grounded LLM prompt for uncertain cases and exit without calling any model (demo without a key)")
     p.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
+    p.add_argument("--proof-timeout", type=int, default=10, help="Seconds per witness run (default 10)")
     p.add_argument("--cache-dir", default=".reachcache")
     args = p.parse_args(argv)
 
@@ -108,74 +111,79 @@ def main(argv=None) -> int:
     print(f"entry evidence: {evidence}")
     print(f"completeness: {ledger.to_dict()}")
 
-    # Phase 4a: deterministic constant propagation BEFORE any LLM (ChatGPT fix)
-    # Simple cases like name="load" do not need a model.
+    # Phase 4: deterministic constant propagation FIRST, LLM only for
+    # what it cannot resolve. Phase 4 fix over the base: the old code
+    # tried only graph.dynamic[0] and passed ALL project functions as
+    # "this module's" candidates. Now every uncertain result tries every
+    # dynamic site, and the prompt gets same-file functions only.
+    # --print-prompt shows the grounded prompt without calling any model,
+    # so the resolver is demoable with no API key at all.
     for r in results:
         if r.verdict != "uncertain" or not graph.dynamic:
             continue
-        d = graph.dynamic[0]
-        try:
-            src = Path(d["file"]).read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-        vals = constant_propagate_getattr(src, d["line"])
-        if vals is None:
-            continue  # genuinely unknown, leave for LLM / uncertain
-        if r.vulnerable_function.split(".")[-1] in vals:
-            r.verdict, r.confidence = "reachable", "high"
-            r.reason += f" | constant propagation: getattr can be {vals} (line {d['line']})"
-        elif vals:
-            r.verdict, r.confidence = "not_reachable", "high"
-            r.reason += f" | constant propagation: getattr can only be {vals}, none vulnerable"
-
-    # Phase 4b: LLM resolver, uncertain only
-    if args.with_llm:
-        for r in results:
-            if r.verdict != "uncertain":
-                continue
-            # Find a dynamic call site in the project (first one, base version)
-            if not graph.dynamic:
-                continue
-            d = graph.dynamic[0]
-            src_path = Path(d["file"])
+        for d in graph.dynamic:
             try:
-                src = src_path.read_text(encoding="utf-8", errors="ignore")
+                src = Path(d["file"]).read_text(encoding="utf-8", errors="ignore")
             except OSError:
                 continue
-            lines = src.splitlines()
-            lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
-            snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
-            prompt = build_prompt(snippet, sorted(graph.functions), extract_string_literals(src),
-                                  [r.vulnerable_function], d["file"], d["line"])
-            ans = resolve_with_llm(prompt)
-            if ans is None:
-                print("LLM resolver: no key / no answer, staying uncertain")
+            if args.print_prompt:
+                lines = src.splitlines()
+                lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
+                snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
+                same_file = sorted(q for q in graph.functions
+                                   if graph.functions[q].file == d["file"])
+                from .resolver import extract_string_literals
+                print(build_prompt(snippet, same_file, extract_string_literals(src),
+                                   [r.vulnerable_function], d["file"], d["line"]))
                 continue
-            ok, failures = verify_answer(ans, set(graph.functions), src, "uncertain")
-            print(f"LLM resolver for {r.advisory_id}: ok={ok} failures={failures} answer={ans}")
-            if not ok:
+            if not args.with_llm:
+                # Constants only, no network, no LLM — even if a key is
+                # set in the environment. The user did not ask for the LLM.
+                from .resolver import constant_propagate_getattr as _cp
+                vals = _cp(src, d["line"])
+                if vals is None:
+                    continue
+                vuln = r.vulnerable_function.split(".")[-1]
+                if vals and vuln in vals:
+                    r.verdict, r.confidence = "reachable", "high"
+                    r.reason += f" | constant propagation: dynamic name can be {vals}, including vulnerable {vuln} (line {d['line']})"
+                elif vals:
+                    r.verdict, r.confidence = "not_reachable", "high"
+                    r.reason += f" | constant propagation: dynamic name can only be {vals}, none vulnerable (line {d['line']})"
+                break
+            outcome = resolve_getattr_case(
+                src, d["line"], [r.vulnerable_function], set(graph.functions),
+                cache=cache, model=args.model)
+            if outcome is None:
                 continue
-            if ans["can_reach"] is True:
-                r.verdict, r.confidence = "reachable", "medium"
-                r.reason += f" | LLM resolver: {ans['reason']} (verified, lines {ans['evidence_lines']})"
-            elif ans["can_reach"] is False:
-                r.verdict, r.confidence = "not_reachable", "medium"
-                r.reason += f" | LLM resolver: {ans['reason']} (verified, lines {ans['evidence_lines']})"
+            if outcome.get("_verification_failed"):
+                print(f"LLM resolver for {r.advisory_id}: {outcome['reason']}")
+                continue
+            r.verdict, r.confidence = outcome["verdict"], outcome["confidence"]
+            r.reason += f" | {outcome['reason']}"
+            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: {r.verdict} ({r.confidence}) — {outcome['reason'][:100]}")
+            break  # one resolved site is enough for this result
 
-    # Phase 5: execution proof, reachable only
+    # Phase 5: execution witness, reachable only. Never changes a verdict:
+    # a failed run keeps the static verdict. Entry functions are passed
+    # as dotted paths relative to their module (mod.Class.method works,
+    # <module> means import-only).
     proofs = {}
     if args.with_proof:
         for r in results:
             if r.verdict != "reachable" or not r.path:
                 continue
             entry_q = r.path[0]
-            entry_file = str(Path(graph.functions[entry_q].file).resolve()) if entry_q in graph.functions else ""
-            entry_func = entry_q.split(".")[-1]
-            if not entry_file:
+            if entry_q not in graph.functions:
                 continue
-            proof = run_execution_proof(str(root), entry_file, entry_func, r.vulnerable_function)
+            entry_file = str(Path(graph.functions[entry_q].file).resolve())
+            # Strip the module prefix: app.Loader.load_config -> Loader.load_config
+            mod = entry_q.rsplit(".", 1)[0] if "." in entry_q else ""
+            entry_func = entry_q[len(mod) + 1:] if mod and entry_q.startswith(mod + ".") else entry_q.split(".")[-1]
+            proof = run_execution_proof(str(root), entry_file, entry_func,
+                                        r.vulnerable_function, timeout=args.proof_timeout)
             proofs[r.advisory_id] = proof
-            print(f"proof {r.advisory_id}: vulnerable_hit={proof['vulnerable_hit']} trace={proof['trace'][:5]}")
+            print(f"proof {r.advisory_id}: vulnerable_hit={proof['vulnerable_hit']} trace={proof['trace'][:5]} error={proof['error']}")
 
     # Ledger is stale after Phase 4 resolution: a dynamic case resolved
     # by constant propagation / verified LLM is no longer unresolved.

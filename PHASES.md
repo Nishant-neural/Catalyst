@@ -372,7 +372,7 @@ invalidate on any change, and never cache unpinned versions.
 ---
 
 
-## Phase 4 — LLM resolver for dynamic / uncertain cases only
+## Phase 4 — LLM resolver for dynamic / uncertain cases only ✅ BUILT
 
 **Goal:** resolve getattr / importlib / plugin cases that deterministic
 code must leave uncertain, without letting the LLM hallucinate a verdict.
@@ -434,6 +434,36 @@ If any rule fails, discard the LLM answer and stay uncertain.
 If no API key is set (`OPENROUTER_API_KEY` / `GROQ_API_KEY`), the
 resolver is skipped entirely and verdicts stay uncertain. That is safe.
 
+### ✅ What Phase 4 actually built (23 Nov 2026, live-verified)
+
+- `constant_propagate_getattr()` rewritten: source order (ast.walk is
+  breadth-first, so reassignment resolved randomly), branch union
+  (if/else `name = "load"` / `"safe_load"` -> both, fail-closed),
+  sequential reassignment last-wins, string concat (`"safe_" + "load"`),
+  var-to-var, and `importlib.import_module("yaml")` as the dynamic arg.
+- `verify_answer()` fixes: rule 10's second half is now checked
+  (can_reach false with possible_values ["load"] used to PASS);
+  `can_reach: 1` no longer passes as true (1 == True in Python);
+  a true/false verdict needs at least one evidence line.
+- `resolve_getattr_case()` — one helper, constants first, LLM second,
+  verifier decides. CLI tries EVERY uncertain result x EVERY dynamic
+  site (base tried only dynamic[0]) and the prompt gets same-file
+  functions only (base passed all project functions as "this module's").
+- LLM answers cached by (model, sha256(prompt)) in `.reachcache`, so a
+  re-scan does not re-spend a call. `--model` picks the model,
+  `--print-prompt` prints the grounded prompt with no key at all.
+- `import_module` alias in the call graph: `mod =
+  importlib.import_module("yaml")` then `mod.load(f)` is yaml.load.
+  Old code dropped it as attr-unresolved — a missed reachable.
+- Live CLI results: app_getattr_load reachable, app_getattr_loop /
+  reassign / concat not_reachable, app_getattr_branch reachable
+  (branch union), app_getattr_config honestly uncertain,
+  app_importlib reachable with full path. No key was needed for any
+  of these — constants decided, LLM never called.
+- Honest limits: no variable type inference (unchanged), no LLM run
+  yet — the resolver needs OPENROUTER_API_KEY / GROQ_API_KEY and the
+  0.8 threshold is still untested against organisers' fixtures.
+
 ### Design Question 2 — answer
 
 How do you handle Python's dynamic features, such as getattr and
@@ -455,7 +485,7 @@ dynamic call is safe just because you cannot see the target.
 
 ---
 
-## Phase 5 — Execution proof + PR debate
+## Phase 5 — Execution proof + PR debate ✅ BUILT
 
 **Goal:** prove reachable claims by running them, and make the PR
 debate trustworthy.
@@ -486,6 +516,30 @@ template. Wire it in the CLI with `--with-proof`. It is intentionally
 simple: entry functions with no arguments work first. Functions that
 need arguments are a stretch, record the trace you do get and keep
 the static verdict.
+
+### ✅ What Phase 5 actually built (23 Nov 2026, live-verified)
+
+- Witness trace filter fixed: the harness records the filename of every
+  call and keeps calls whose file is under the project root, plus the
+  vulnerable call. app_witness_wrapper trace is now
+  `entry_mod.main -> helpers.parse_config -> yaml.load` — the old filter
+  dropped the wrapper middle.
+- Dotted entries: `mod.Class.method` is resolved by walking attributes;
+  `<module>` entries are witnessed by importing only (app_top: hit).
+- SystemExit no longer kills the harness before it prints (only
+  Exception was caught). Entry needing args (app_proof_args): witness
+  misses with TypeError recorded, static verdict stays reachable —
+  a failed witness never downgrades.
+- Resource limits in the harness (RLIMIT_CPU 10s, RLIMIT_AS 512MB,
+  POSIX), plus the 10s subprocess timeout as the outer bound.
+- `answer_challenge()` now checks the cited line: it must contain a
+  support token (vulnerable name / caller on the path) and must be a
+  NEW line. An unrelated line, a repeated line, or no citation flips
+  the verdict to UNCERTAIN. The base version recorded any in-range
+  citation and kept the verdict — it never checked anything.
+- Honest limits: a witness is one run with one input, it corroborates
+  a static path, it never proves unreachability; no sandbox (venv is
+  not isolation), multi-threaded code is not traced.
 
 ### 5b. PR debate agent — `debate.py` — WRITE-UP ONLY (rule 4)
 

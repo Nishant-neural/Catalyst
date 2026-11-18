@@ -138,10 +138,33 @@ class _FileVisitor(ast.NodeVisitor):
         # Only single-target, single-value assignments.
         if len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
             target = node.targets[0].id
+            # import_module alias: mod = importlib.import_module("yaml")
+            # then mod.load(...) is yaml.load. Phase 4: without this the
+            # call was attr-unresolved and dropped — a missed reachable.
+            if isinstance(node.value, ast.Call):
+                mod_name = self._import_module_name(node.value)
+                if mod_name:
+                    self.aliases[target] = mod_name
+                    self.generic_visit(node)
+                    return
             resolved, _kind = self._resolve_expr(node.value)
             if resolved and resolved != target:
                 self.aliases[target] = resolved
         self.generic_visit(node)
+
+    def _import_module_name(self, node) -> str | None:
+        """importlib.import_module("yaml") -> "yaml"; __import__("yaml") -> "yaml".
+        Only a string literal first argument counts. Anything else is unknown."""
+        func = node.func
+        is_import_module = (
+            isinstance(func, ast.Attribute) and func.attr == "import_module"
+        ) or (isinstance(func, ast.Name) and func.id == "__import__")
+        if not is_import_module or not node.args:
+            return None
+        arg = node.args[0]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+        return None
 
     def _dotted(self, node) -> str | None:
         """Reconstruct a dotted name from Name / Attribute chains."""
