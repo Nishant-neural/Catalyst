@@ -73,25 +73,34 @@ try:
     import importlib.util
     spec = importlib.util.spec_from_file_location("entry_mod", entry_file)
     mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    executed = True
-    if entry_func == "<module>":
-        pass  # top-level code already ran on import; that is the witness
+    try:
+        spec.loader.exec_module(mod)
+    except BaseException as e:
+        # The entry module itself failed to import (e.g. a missing
+        # dependency like yaml in a fresh venv). That is a witness
+        # failure, not a harness crash: report it as the error, keep
+        # the static verdict. The old harness let this propagate and
+        # printed no JSON at all, so the caller saw a crash.
+        error = f"import: {type(e).__name__}: {e}"
     else:
-        # Dotted entry: mod.Class.method -> walk attributes.
-        target = mod
-        for part in entry_func.split("."):
-            target = getattr(target, part, None)
-            if target is None:
-                break
-        if target is None:
-            error = "entry not found"
+        executed = True
+        if entry_func == "<module>":
+            pass  # top-level code already ran on import; that is the witness
         else:
-            try:
-                target()
-            except BaseException as e:
-                # fn() may need args or call sys.exit(); the trace still counts.
-                error = f"{type(e).__name__}: {e}"
+            # Dotted entry: mod.Class.method -> walk attributes.
+            target = mod
+            for part in entry_func.split("."):
+                target = getattr(target, part, None)
+                if target is None:
+                    break
+            if target is None:
+                error = "entry not found"
+            else:
+                try:
+                    target()
+                except BaseException as e:
+                    # fn() may need args or call sys.exit(); the trace still counts.
+                    error = f"{type(e).__name__}: {e}"
 finally:
     sys.settrace(None)
 print(json.dumps({"executed": executed, "trace": trace_log, "error": error}))
@@ -101,8 +110,19 @@ print(json.dumps({"executed": executed, "trace": trace_log, "error": error}))
 def run_execution_proof(project_root: str, entry_file: str, entry_func: str,
                         vulnerable: str, timeout: int = 10) -> dict:
     """Run harness in a subprocess. Returns proof dict."""
+    import os
     root = str(Path(project_root).resolve())
     harness_src = HARNESS
+    # Windows fix: the old code replaced the whole environment with
+    # PATH=/usr/bin:/bin, which is a Unix path. On Windows that breaks
+    # DLL loading for the child interpreter. Keep the parent environment
+    # (PATH included) and only set the Python variables; restrict PATH
+    # to /usr/bin:/bin on POSIX only.
+    env = dict(os.environ)
+    env["PYTHONPATH"] = root
+    env["PYTHONNOUSERSITE"] = "1"
+    if os.name == "posix":
+        env["PATH"] = "/usr/bin:/bin"
     with tempfile.TemporaryDirectory() as td:
         harness = Path(td) / "harness.py"
         harness.write_text(harness_src, encoding="utf-8")
@@ -110,7 +130,7 @@ def run_execution_proof(project_root: str, entry_file: str, entry_func: str,
             r = subprocess.run(
                 [sys.executable, str(harness), entry_file, entry_func, root],
                 cwd=root, capture_output=True, text=True, timeout=timeout,
-                env={"PATH": "/usr/bin:/bin", "PYTHONPATH": root, "PYTHONNOUSERSITE": "1"},
+                env=env,
             )
         except subprocess.TimeoutExpired:
             return {"executed": False, "vulnerable_hit": False, "trace": [], "error": "timeout"}

@@ -112,57 +112,79 @@ def main(argv=None) -> int:
     print(f"completeness: {ledger.to_dict()}")
 
     # Phase 4: deterministic constant propagation FIRST, LLM only for
-    # what it cannot resolve. Phase 4 fix over the base: the old code
-    # tried only graph.dynamic[0] and passed ALL project functions as
-    # "this module's" candidates. Now every uncertain result tries every
-    # dynamic site, and the prompt gets same-file functions only.
+    # what it cannot resolve. Aggregation rule (19 Nov 2026 fix — the
+    # real PyYAML 5.3.1 sdist caught this): ONE dynamic site's answer
+    # decides ONE site, never the whole result. The old code took the
+    # first site that resolved to a literal list and let it decide:
+    # a single getattr with name "encoding" marked all 7 PyYAML
+    # candidates not_reachable, including yaml.load, which the test
+    # suite genuinely calls. Correct rule:
+    #   - any site resolving to the vulnerable name -> reachable
+    #   - ALL sites resolved safe, none unknown -> not_reachable
+    #   - otherwise -> stay uncertain, and say how many sites resolved
     # --print-prompt shows the grounded prompt without calling any model,
     # so the resolver is demoable with no API key at all.
     for r in results:
         if r.verdict != "uncertain" or not graph.dynamic:
             continue
-        for d in graph.dynamic:
+        sites = graph.dynamic
+        resolved_safe = 0
+        unresolved = 0
+        llm_used = False
+        hit_reason = ""
+        hit_conf = "high"
+        for d in sites:
             try:
                 src = Path(d["file"]).read_text(encoding="utf-8", errors="ignore")
             except OSError:
+                unresolved += 1
                 continue
             if args.print_prompt:
-                lines = src.splitlines()
-                lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
-                snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
-                same_file = sorted(q for q in graph.functions
-                                   if graph.functions[q].file == d["file"])
-                from .resolver import extract_string_literals
-                print(build_prompt(snippet, same_file, extract_string_literals(src),
-                                   [r.vulnerable_function], d["file"], d["line"]))
+                # Demo: first site only, not all 51 of them.
+                if d is sites[0]:
+                    lines = src.splitlines()
+                    lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
+                    snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
+                    same_file = sorted(q for q in graph.functions
+                                       if graph.functions[q].file == d["file"])
+                    from .resolver import extract_string_literals
+                    print(build_prompt(snippet, same_file, extract_string_literals(src),
+                                       [r.vulnerable_function], d["file"], d["line"]))
+                    print(f"# ... and {len(sites) - 1} more dynamic sites "
+                          f"(run with --with-llm to resolve them all)")
                 continue
-            if not args.with_llm:
-                # Constants only, no network, no LLM — even if a key is
-                # set in the environment. The user did not ask for the LLM.
-                from .resolver import constant_propagate_getattr as _cp
-                vals = _cp(src, d["line"])
-                if vals is None:
-                    continue
-                vuln = r.vulnerable_function.split(".")[-1]
-                if vals and vuln in vals:
-                    r.verdict, r.confidence = "reachable", "high"
-                    r.reason += f" | constant propagation: dynamic name can be {vals}, including vulnerable {vuln} (line {d['line']})"
-                elif vals:
-                    r.verdict, r.confidence = "not_reachable", "high"
-                    r.reason += f" | constant propagation: dynamic name can only be {vals}, none vulnerable (line {d['line']})"
-                break
             outcome = resolve_getattr_case(
                 src, d["line"], [r.vulnerable_function], set(graph.functions),
-                cache=cache, model=args.model)
+                cache=cache, model=args.model, allow_llm=args.with_llm)
             if outcome is None:
+                unresolved += 1
                 continue
             if outcome.get("_verification_failed"):
                 print(f"LLM resolver for {r.advisory_id}: {outcome['reason']}")
+                unresolved += 1
                 continue
-            r.verdict, r.confidence = outcome["verdict"], outcome["confidence"]
-            r.reason += f" | {outcome['reason']}"
-            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: {r.verdict} ({r.confidence}) — {outcome['reason'][:100]}")
-            break  # one resolved site is enough for this result
+            if "LLM resolver" in outcome["reason"]:
+                llm_used = True
+            if outcome["verdict"] == "reachable":
+                hit_reason = outcome["reason"]
+                hit_conf = outcome["confidence"]
+                break
+            resolved_safe += 1
+        if hit_reason:
+            r.verdict, r.confidence = "reachable", hit_conf
+            r.reason += f" | {hit_reason}"
+            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: reachable — {hit_reason[:100]}")
+        elif unresolved == 0 and resolved_safe == len(sites):
+            # Every dynamic site resolved, none can hit the target.
+            conf = "medium" if llm_used else "high"
+            r.verdict, r.confidence = "not_reachable", conf
+            r.reason = (f"No static path. Phase 4 resolved all {len(sites)} "
+                        f"dynamic call site(s); none can reach {r.vulnerable_function}.")
+            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: not_reachable "
+                  f"({conf}, all {len(sites)} dynamic sites resolved safe)")
+        else:
+            r.reason += (f" | Phase 4: resolved {resolved_safe}/{len(sites)} dynamic "
+                         f"sites safe, {unresolved} still unknown — staying uncertain")
 
     # Phase 5: execution witness, reachable only. Never changes a verdict:
     # a failed run keeps the static verdict. Entry functions are passed

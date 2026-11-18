@@ -5,3 +5,4 @@ report.json
 openvex.json
 .venv/
 *.egg-info/
+.env

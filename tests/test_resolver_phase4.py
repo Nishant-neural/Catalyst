@@ -1,6 +1,7 @@
 """Phase 4 tests: constant propagation (source order, branch union,
 concat, var-to-var, importlib), the 10-rule verifier, and the
 resolve_getattr_case helper (constants only — no network, no key)."""
+import json
 import unittest
 from pathlib import Path
 import sys
@@ -142,3 +143,21 @@ class TestPhase4FixturesEndToEnd(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPhase4Aggregation(unittest.TestCase):
+    """19 Nov 2026 regression: one safe dynamic site must not clear a
+    result when another site is unresolvable. The real PyYAML 5.3.1
+    sdist had 51 dynamic triggers; a single getattr(..., "encoding")
+    marked all 7 candidates not_reachable, including yaml.load."""
+
+    def test_mixed_sites_stay_uncertain(self):
+        from pyreach.cli import main as cli_main
+        out = Path("/tmp") / "mixed-report.json"
+        code = cli_main(["scan", str(BASE / "fixtures" / "app_getattr_mixed"),
+                         "--advisory", str(BASE / "examples" / "advisory-sample.json"),
+                         "--out", str(out), "--cache-dir", "/tmp/mixed-cache"])
+        rep = json.loads(out.read_text())
+        self.assertEqual(rep["results"][0]["verdict"], "uncertain")
+        self.assertEqual(code, 0)
+        self.assertIn("1/2", rep["results"][0]["reason"])

@@ -25,10 +25,28 @@ from __future__ import annotations
 import json
 import re
 
-import requests
-
 from .advisory import Advisory, VulnerableFunction, diff_to_functions, names_from_text
 from .cache import Cache, cache_key
+
+# requests is imported LAZILY, inside _get_requests(), not at module level.
+# Windows fix (19 Nov 2026): a fresh venv often has no requests installed,
+# and the top-level import killed the whole CLI — every scan crashed with
+# ModuleNotFoundError before doing any work. Offline scans (Phases 2-5)
+# never touch the network, so they must work with no requests at all.
+# Only the live fetch (Phase 1) needs it, and it now fails with a clear
+# "pip install requests" message instead of an import crash.
+
+
+def _get_requests():
+    """Import requests on demand. Raises a readable error, not ImportError."""
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError(
+            "live fetch needs the 'requests' package: pip install requests "
+            "(or pip install -r requirements.txt). Offline scans do not need it."
+        )
+    return requests
 
 OSV_URL = "https://api.osv.dev/v1/query"
 COMMIT_RE = re.compile(r"github\.com/([^/]+/[^/]+)/commit/([0-9a-f]{40})")
@@ -38,6 +56,7 @@ COMMIT_SHORT_RE = re.compile(r"github\.com/([^/]+/[^/]+)/commit/([0-9a-f]{7,40})
 def fetch_osv(package: str, version: str, ecosystem: str = "PyPI") -> list[Advisory]:
     """Query api.osv.dev for a package@version. Returns Advisory objects
     with id, package, fixed_version, references, summary. No API key needed."""
+    requests = _get_requests()
     r = requests.post(OSV_URL, json={
         "package": {"name": package, "ecosystem": ecosystem},
         "version": version,
@@ -90,6 +109,9 @@ def fetch_github_diff(repo: str, sha: str, cache: Cache | None = None) -> str:
         hit = cache.get(key)
         if hit is not None:
             return hit["diff"]
+    # The lazy import goes AFTER the cache check: a cache hit must work
+    # with no requests installed (this is what the FakeCache test checks).
+    requests = _get_requests()
     url = f"https://github.com/{repo}/commit/{sha}.diff"
     r = requests.get(url, headers={"User-Agent": "pyreach/0.1.0"}, timeout=30)
     r.raise_for_status()
@@ -100,6 +122,7 @@ def fetch_github_diff(repo: str, sha: str, cache: Cache | None = None) -> str:
 
 def fetch_github_file(repo: str, sha: str, path: str) -> str:
     """Fetch a single file at a commit, via raw.githubusercontent.com."""
+    requests = _get_requests()
     # Strip leading lib/ or lib3/ prefixes? Caller passes the diff path as-is;
     # try it, then try without a leading lib/ segment.
     for p in (path, path.removeprefix("lib/"), path.removeprefix("lib3/")):
@@ -277,6 +300,7 @@ def fetch_pypi_sdist_diff(package: str, old_version: str, new_version: str,
     This is slower than a GitHub diff and only used when no commit exists.
     Phase 3: cached by (package, old->new, sdist sha256). The sha256 from
     PyPI metadata is the artifact hash, so a cached diff can never be stale."""
+    requests = _get_requests()
     import difflib
     import io
     import tarfile

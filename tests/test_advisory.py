@@ -1,4 +1,5 @@
 import sys
+import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -14,11 +15,19 @@ DIFF = """--- a/yaml/__init__.py
 
 SRC = {"yaml/__init__.py": "def load(stream):\n    return safe_load(stream)\n\ndef safe_load(stream):\n    return {}\n"}
 
-def test_diff_to_functions():
-    fns = diff_to_functions(DIFF, SRC, commit="abc123")
-    assert any(f.qualified.endswith("load") for f in fns), fns
-    assert fns[0].confidence in ("high", "medium")
 
-def test_parse_diff():
-    changed = parse_unified_diff(DIFF)
-    assert "yaml/__init__.py" in changed
+class TestAdvisory(unittest.TestCase):
+    # Plain functions, not TestCase methods, so `python -m unittest`
+    # skipped these 2 tests while pytest ran them. Fixed 19 Nov 2026.
+    def test_diff_to_functions(self):
+        fns = diff_to_functions(DIFF, SRC, commit="abc123")
+        self.assertTrue(any(f.qualified.endswith("load") for f in fns), fns)
+        self.assertIn(fns[0].confidence, ("high", "medium"))
+
+    def test_parse_diff(self):
+        changed = parse_unified_diff(DIFF)
+        self.assertIn("yaml/__init__.py", changed)
+
+
+if __name__ == "__main__":
+    unittest.main()

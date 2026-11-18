@@ -15,7 +15,11 @@ import json
 import os
 import re
 
-DEFAULT_MODEL = "openai/gpt-oss-20b"
+DEFAULT_MODEL = "openai/gpt-oss-20b:free"
+# The :free suffix matters: openai/gpt-oss-20b without it is the paid
+# variant on OpenRouter. The free tier needs the :free model id, and
+# even then it is rate-limited (tens to a couple hundred requests/day).
+# Without a key the resolver is never called at all.
 CONFIDENCE_THRESHOLD = 0.8  # starting value, tune on organisers' fixtures
 
 
@@ -292,17 +296,24 @@ def resolve_with_llm(prompt: str, api_key: str | None = None,
 
 def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
                          symbol_table: set[str], cache=None,
-                         model: str = DEFAULT_MODEL) -> dict | None:
+                         model: str = DEFAULT_MODEL,
+                         allow_llm: bool = True) -> dict | None:
     """One uncertain dynamic call site, deterministic first, LLM second.
 
     Returns {"verdict", "confidence", "reason"} or None to stay uncertain.
     1. Constant propagation: if the name is a literal / loop over literals
        / concat / var-to-var, decide without any LLM.
     2. Otherwise build the grounded prompt (same-file functions only,
-       string literals, vulnerable list) and ask the LLM once. The
-       10-rule verifier decides; a failed verification stays uncertain.
+       string literals, vulnerable list) and ask the LLM once — only if
+       allow_llm is True. The caller passes False when the user did not
+       ask for the LLM, even if a key happens to be set in the environment.
+       The 10-rule verifier decides; a failed verification stays uncertain.
     Never returns a verdict that downgrades a deterministic reachable —
     the caller only feeds it uncertain results.
+
+    One site's answer decides ONE site, not the whole result. The caller
+    (cli.py) must aggregate across all dynamic sites: a single safe site
+    does not make the target not_reachable — see the 19 Nov 2026 fix.
     """
     vuln_simple = {v.split(".")[-1] for v in vulnerable}
     vals = constant_propagate_getattr(source, call_line)
@@ -316,7 +327,10 @@ def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
                     "reason": f"constant propagation: dynamic name can be {vals}, including vulnerable {hit} (line {call_line})"}
         return {"verdict": "not_reachable", "confidence": "high",
                 "reason": f"constant propagation: dynamic name can only be {vals}, none vulnerable (line {call_line})"}
-    # LLM, only because the deterministic step could not decide.
+    # LLM, only because the deterministic step could not decide, and
+    # only if the caller allowed it.
+    if not allow_llm:
+        return None
     lines = source.splitlines()
     lo, hi = max(0, call_line - 25), min(len(lines), call_line + 25)
     snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))

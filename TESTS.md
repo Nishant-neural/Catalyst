@@ -1,0 +1,236 @@
+# Tests to perform — pyreach, Phases 1–5
+
+One command runs everything, and every check prints PASS or FAIL:
+
+```bash
+python verify.py            # offline: 48 unit tests + 24 fixture scans + prompt + witness
+python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
+```
+
+## Setup first — Windows, read this
+
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
+```
+
+Two traps that cost real debugging time on 19 Nov 2026:
+
+1. **`python` vs `python3` are different Pythons on Windows.** If you have
+   MSYS2/Git Bash installed, `python3` is usually the MSYS2 system Python,
+   which has none of your packages. Your venv Python is `python`. Always
+   run `python verify.py`, never `python3 verify.py`, or you get
+   `ModuleNotFoundError: No module named 'requests'` even though the venv
+   has requests installed. `verify.py` prints a dependency precheck first
+   thing, so a wrong interpreter shows up immediately.
+2. **pytest is not installed by `pip install -e .`** — it is not a runtime
+   dependency. Either `pip install pytest` or use stdlib unittest:
+   `python -m unittest discover -s tests -q`. `verify.py` tries pytest
+   first and falls back to unittest on its own.
+
+No API key is needed for any of these. If `verify.py` exits 0, the whole
+pipeline works. If something fails, it tells you the expected verdict and
+exit code versus what it got, per fixture.
+
+## The checklist, by hand
+
+### 1. Unit suite — the deterministic core
+
+```bash
+python3 -m pytest tests -q
+# if pytest is not installed, the same 48 tests run with stdlib unittest:
+python3 -m unittest discover -s tests -q
+```
+
+Expect: **48 passed**. These cover the call graph, the verifier's 10 rules,
+constant propagation, the witness, and the debate rule. (`verify.py` tries
+pytest first and falls back to unittest on its own.)
+
+### 2. Fixture scans — expected verdicts (sample advisory, no network)
+
+```bash
+python3 -m pyreach.cli scan fixtures/<name> --advisory examples/advisory-sample.json
+```
+
+Exit code is part of the contract: **2 = reachable, 0 = not_reachable / uncertain**.
+
+| Fixture | Expected | What it proves |
+|---|---|---|
+| app_vuln | reachable, exit 2 | basic path main → load_config → yaml.load |
+| app_safe | not_reachable, exit 0 | only safe_load is used |
+| app_dead | not_reachable, exit 0 | dead() calls yaml.load but is never called |
+| app_getattr | not_reachable, exit 0 | `name = "safe_load"` resolved by constants |
+| app_wrapper | reachable, exit 2 | call through helpers.parse_config |
+| app_route | reachable, exit 2 | Flask @app.route handler is an entry |
+| app_top | reachable, exit 2 | yaml.load at import time (top-level code) |
+| app_nested | reachable, exit 2 | call after a nested def is not dropped |
+| app_method | reachable, exit 2 | self./cls. resolves to the right class |
+| app_star | reachable, exit 2 | star import picks the right module |
+| app_alias | reachable, exit 2 | `load = yaml.load` then `load(f)` |
+| app_console | reachable, exit 2 | console_scripts entry, dead() is NOT an entry |
+| app_django | reachable, exit 2 | urlpatterns view is an entry, unused view is not |
+| app_library | reachable, exit 2 | library mode: only `__all__` is an entry |
+| app_click | reachable, exit 2 | click group command is an entry |
+| app_getattr_load | reachable, exit 2 | constants: `name = "load"` |
+| app_getattr_loop | not_reachable, exit 0 | constants: loop over safe names only |
+| app_getattr_config | **uncertain**, exit 0 | name comes from config — must stay uncertain |
+| app_getattr_branch | reachable, exit 2 | if/else union: either branch can hit |
+| app_getattr_reassign | not_reachable, exit 0 | later assignment wins |
+| app_getattr_concat | not_reachable, exit 0 | `"safe_" + "load"` |
+| app_importlib | reachable, exit 2 | `importlib.import_module("yaml")` then `.load` |
+| app_witness_wrapper | reachable, exit 2 | wrapper path, witness keeps the middle |
+| app_proof_args | reachable, exit 2 | entry needs args: witness misses, verdict stays |
+| app_getattr_mixed | **uncertain**, exit 0 | two dynamic sites: one safe literal, one config — one safe site must NOT clear the result |
+
+### 3. Phase 4 — the resolver, no key needed
+
+```bash
+# See the exact prompt the LLM would get, grounded, no model call:
+python3 -m pyreach.cli scan fixtures/app_getattr_config \
+  --advisory examples/advisory-sample.json --print-prompt
+```
+
+Check the prompt lists only functions from that one file (same-file
+candidates), the string literals, and the vulnerable function.
+
+With a key (OpenRouter or Groq, free tier), the LLM path runs:
+
+```bash
+export OPENROUTER_API_KEY=...
+python3 -m pyreach.cli scan fixtures/app_getattr_config \
+  --advisory examples/advisory-sample.json --with-llm
+```
+
+Expect it to **stay uncertain** — the name comes from config, and a good
+answer there is "unknown". If it ever flips that fixture to not_reachable,
+the verifier failed.
+
+### 4. Phase 5 — the witness
+
+```bash
+python3 -m pyreach.cli scan fixtures/app_witness_wrapper \
+  --advisory examples/advisory-sample.json --with-proof
+python3 -m pyreach.cli scan fixtures/app_proof_args \
+  --advisory examples/advisory-sample.json --with-proof
+```
+
+Expect: the wrapper trace reads
+`entry_mod.main -> helpers.parse_config -> yaml.load`; the args fixture
+records a TypeError and keeps the verdict reachable.
+
+### 5. Live test — the real advisory pipeline (needs network)
+
+```bash
+python3 -m pyreach.cli fetch PyYAML 5.3.1 --out /tmp/advisories.json
+python3 -m pyreach.cli scan fixtures/app_vuln --advisory /tmp/advisories.json
+```
+
+Expect the fetch to print `GHSA-8q59-q68h-6hv4` (CVE-2020-14343, fixed
+5.4) with 7 medium-confidence candidates, and the scan to report
+**4 reachable / 3 not_reachable / 0 uncertain, exit 2**. Run the fetch
+twice: the second run should report a cache hit with byte-identical output.
+
+## Try to break it — the adversarial tests
+
+These are the tests that matter for the judges. Each one is a one-line
+change to a fixture, then re-scan and check the verdict flips the right way:
+
+1. **app_safe → make it vulnerable.** Change `safe_load` to `load` in
+   `fixtures/app_safe/app.py`. Expect reachable, exit 2. Change it back.
+2. **app_dead → call dead().** Add a call to `dead()` in `main()`. Expect
+   reachable. Remove it.
+3. **app_getattr → config source.** Change `name = "safe_load"` to
+   `name = config["func"]` (add `config = {"func": "load"}` at the top).
+   Expect uncertain, never not_reachable.
+4. **app_getattr_load → hide the name.** Change `name = "load"` to
+   `name = os.environ["FUNC"]`. Expect uncertain.
+5. **Delete a file.** Remove `fixtures/app_vuln/config.yaml` and scan with
+   `--with-proof`. Expect the witness to fail gracefully and the static
+   verdict to stay reachable. Restore the file.
+6. **The worst failure — a false not_reachable.** Any change above that
+   makes a reachable case report not_reachable is a fail-closed bug.
+   Report it, do not work around it: that is exactly what the
+   completeness ledger and the uncertain rate in the report are for.
+
+## Test on a real library — PyYAML 5.3.1's own source
+
+This is the real-workflow test. It caught a genuine bug on 19 Nov 2026
+(see below), so run it exactly like this:
+
+```bash
+pip download PyYAML==5.3.1 --no-deps --no-binary :all: -d /tmp/real-test
+cd /tmp/real-test && tar xzf PyYAML-5.3.1.tar.gz
+python -m pyreach.cli scan PyYAML-5.3.1 --package PyYAML --version 5.3.1
+```
+
+Expect: **7 uncertain, 0 not_reachable, exit 0**, in about 6 seconds.
+The report's reason for `yaml.load` should read
+"resolved 9/51 dynamic sites safe, 42 still unknown — staying uncertain".
+
+Why uncertain and not reachable? PyYAML's own tests genuinely call
+`yaml.load` (tests/lib3/test_yaml_ext.py:248), but only through the test
+runner's dynamic dispatch, so there is no static path from any entry
+point. Uncertain is the honest answer here. Before the 19 Nov fix the
+tool said **not_reachable** for all 7 candidates, because a single
+`getattr(..., "encoding")` site resolved safe and the old Phase 4 let
+one site decide the whole result. If you ever see not_reachable on
+this scan again, that bug is back.
+
+Also expect in the ledger: `project_source: 59/79 parsed`. The other 20
+files are the Python 2 versions of the same code (lib/ and tests/lib/),
+which Python 3's parser cannot parse. That is recorded, not hidden.
+
+## Test on any real repo
+
+```bash
+git clone <any Python repo that uses PyYAML>
+python -m pyreach.cli scan <repo> --package PyYAML --version 5.3.1
+```
+
+That fetches the live advisory and scans real code against it. Start with
+a small project you know: one file that calls `yaml.load`, one that only
+calls `yaml.safe_load`. Check the verdicts match what you know, then try a
+bigger repo and read `report.json` — especially the completeness ledger
+and the uncertain rate. On a big repo, skip `--with-proof` at first: the
+witness runs one subprocess per reachable result.
+
+## The LLM — do you need it, and where the key goes
+
+**No, not for the core workflow.** Phases 1, 2, 3 and 5 run with no LLM
+and no key. The LLM only runs when you pass `--with-llm`, and only for
+results that are still uncertain after constant propagation — it is the
+last resort for dynamic cases, never the decider (the 10-rule verifier
+decides, and a failed verification stays uncertain).
+
+To enable it, get a free key from OpenRouter:
+
+1. Go to [openrouter.ai/keys](https://openrouter.ai/keys) and sign up
+   (GitHub or Google, no credit card). Create a key, copy it — it starts
+   with `sk-or-v1-` and is shown once.
+2. Use the free model id `openai/gpt-oss-20b:free` (the `:free` suffix
+   matters: without it, it is the paid variant). Free tier is
+   rate-limited, roughly tens to a couple hundred requests a day.
+3. Put the key in an environment variable, never in code or a file
+   you commit. PowerShell, this session only:
+   ```powershell
+   $env:OPENROUTER_API_KEY='sk-or-v1-...'
+   ```
+   Permanent (then restart the terminal):
+   ```powershell
+   [System.Environment]::SetEnvironmentVariable('OPENROUTER_API_KEY','sk-or-v1-...','User')
+   ```
+   On Linux/macOS: `export OPENROUTER_API_KEY='sk-or-v1-...'`.
+4. Run it:
+   ```bash
+   python -m pyreach.cli scan fixtures/app_getattr_config \
+     --advisory examples/advisory-sample.json --with-llm \
+     --model openai/gpt-oss-20b:free
+   ```
+   Expect `app_getattr_config` to **stay uncertain** — its name comes
+   from config, and the correct LLM answer there is "unknown". If it
+   ever flips to not_reachable, the verifier failed.
+
+Groq is the alternative: a free key from console.groq.com/keys, set
+`GROQ_API_KEY`, and pass `--model llama-3.1-8b-instant` with
+`LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions`.

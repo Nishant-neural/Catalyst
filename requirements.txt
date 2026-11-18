@@ -1,0 +1,10 @@
+# pyreach dependencies. Install in your venv before testing:
+#   python -m pip install -r requirements.txt
+#
+# requests: only the live fetch (Phase 1) needs it. Offline scans work
+# without it. pyyaml: the fixtures import yaml, so the witness tests
+# and --with-proof need it. pytest is only for `pytest tests/`; the
+# same 48 tests run with stdlib unittest if pytest is not installed.
+requests>=2.31
+pyyaml>=6.0
+pytest>=7.0

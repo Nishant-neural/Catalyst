@@ -1,4 +1,5 @@
 import sys
+import unittest
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -9,30 +10,28 @@ from pyreach.advisory import load_advisories
 
 ROOT = Path(__file__).resolve().parents[1]
 
-def test_vuln_is_reachable():
-    g = build_graph(ROOT / "fixtures" / "app_vuln")
-    entries, _ = find_entrypoints(ROOT / "fixtures" / "app_vuln", g)
-    advs = load_advisories(str(ROOT / "examples" / "advisory-sample.json"))
-    results = analyze(advs, g, entries)
-    assert results[0].verdict == "reachable", results
 
-def test_safe_is_not_reachable():
-    g = build_graph(ROOT / "fixtures" / "app_safe")
-    entries, _ = find_entrypoints(ROOT / "fixtures" / "app_safe", g)
-    advs = load_advisories(str(ROOT / "examples" / "advisory-sample.json"))
-    results = analyze(advs, g, entries)
-    assert results[0].verdict == "not_reachable", results
+class TestCallGraphBase(unittest.TestCase):
+    # Plain functions, not TestCase methods, so `python -m unittest`
+    # skipped these 4 tests while pytest ran them. Fixed 19 Nov 2026.
+    def _results(self, fixture):
+        g = build_graph(ROOT / "fixtures" / fixture)
+        entries, _ = find_entrypoints(ROOT / "fixtures" / fixture, g)
+        advs = load_advisories(str(ROOT / "examples" / "advisory-sample.json"))
+        return analyze(advs, g, entries)
 
-def test_dead_code_is_not_reachable():
-    g = build_graph(ROOT / "fixtures" / "app_dead")
-    entries, _ = find_entrypoints(ROOT / "fixtures" / "app_dead", g)
-    advs = load_advisories(str(ROOT / "examples" / "advisory-sample.json"))
-    results = analyze(advs, g, entries)
-    assert results[0].verdict == "not_reachable", results
+    def test_vuln_is_reachable(self):
+        self.assertEqual(self._results("app_vuln")[0].verdict, "reachable")
 
-def test_getattr_is_uncertain():
-    g = build_graph(ROOT / "fixtures" / "app_getattr")
-    entries, _ = find_entrypoints(ROOT / "fixtures" / "app_getattr", g)
-    advs = load_advisories(str(ROOT / "examples" / "advisory-sample.json"))
-    results = analyze(advs, g, entries)
-    assert results[0].verdict == "uncertain", results
+    def test_safe_is_not_reachable(self):
+        self.assertEqual(self._results("app_safe")[0].verdict, "not_reachable")
+
+    def test_dead_code_is_not_reachable(self):
+        self.assertEqual(self._results("app_dead")[0].verdict, "not_reachable")
+
+    def test_getattr_is_uncertain(self):
+        self.assertEqual(self._results("app_getattr")[0].verdict, "uncertain")
+
+
+if __name__ == "__main__":
+    unittest.main()

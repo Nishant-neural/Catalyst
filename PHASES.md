@@ -460,6 +460,19 @@ resolver is skipped entirely and verdicts stay uncertain. That is safe.
   (branch union), app_getattr_config honestly uncertain,
   app_importlib reachable with full path. No key was needed for any
   of these — constants decided, LLM never called.
+
+- **Aggregation fix, 19 Nov 2026 (found by the real PyYAML sdist scan):**
+  one dynamic site's answer decided the whole result. A single
+  `getattr(..., "encoding")` marked all 7 PyYAML candidates
+  not_reachable, including yaml.load, which the test suite genuinely
+  calls (via the test runner's dynamic dispatch, so no static path).
+  Now: any site resolving to the vulnerable name -> reachable; ALL
+  sites resolved safe -> not_reachable; otherwise uncertain, with the
+  count in the reason ("resolved 9/51 dynamic sites safe, 42 still
+  unknown"). Regression fixture app_getattr_mixed + test.
+  The sdist scan now honestly reports 7 uncertain, 0 not_reachable.
+- Default model is now `openai/gpt-oss-20b:free` — the :free suffix
+  matters, without it OpenRouter bills the paid variant.
 - Honest limits: no variable type inference (unchanged), no LLM run
   yet — the resolver needs OPENROUTER_API_KEY / GROQ_API_KEY and the
   0.8 threshold is still untested against organisers' fixtures.
