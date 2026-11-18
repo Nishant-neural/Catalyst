@@ -139,11 +139,56 @@ finished. Do not fake a fix commit.
 
 ---
 
-## Phase 2 — Call graph + reachability (deterministic)
+## Phase 2 — Call graph + reachability (deterministic) ✅ BUILT
 
 **Goal:** build a call graph with AST only, then BFS from entry points.
 **Files:** `pyreach/callgraph.py`, `pyreach/reach.py`
 **Time:** hours 6-11.
+**Status: built and hardened, 18 Nov. 15 tests pass (was 8).**
+All 11 fixtures give the expected verdict via the CLI.
+
+### What Phase 2 hardening fixed (8 changes in `callgraph.py`)
+
+1. **Nested functions:** the old visitor set `current=None` after a nested
+   def, so calls in the outer function *after* the nested def were dropped.
+   Now `current` is a stack (save/restore). Fixture: `app_nested`.
+2. **Top-level module code** is a pseudo-node `module.<module>`, and it is
+   a real entry point (import runs it). A project calling `yaml.load` at
+   import time with no `main()` was previously missed entirely.
+   Fixture: `app_top`, path `app.<module> -> yaml.load`.
+3. **`self.` / `cls.`** resolve to the enclosing class, even when another
+   class has a same-named method (old: ambiguous -> uncertain).
+   Fixture: `app_method`, path through `app.Loader.load_config ->
+   app.Loader.helper`, not `SafeLoader`.
+4. **Constructor receivers:** `Loader().load_config()` resolves to
+   `module.Loader.load_config` (old: ambiguous on `load_config`).
+5. **Dotted chains:** `a.b.load()` is reconstructed as a full dotted name
+   with the base resolved through imports (old: returned just `load`).
+6. **`import a.b.c`** binds `a`, not `a.b.c` (old map was wrong).
+7. **Assignment aliases:** `load = yaml.load` then `load(f)` is a real call
+   to `yaml.load`. Fixture: `app_alias`. Old code missed it — a false
+   not-reachable, the worst failure.
+8. **Star imports:** `from helpers import *` prefers the star-imported
+   module when a simple name is ambiguous project-wide.
+   Fixture: `app_star` (helpers vs legacy both define `parse_config`).
+   Pass 2 also rebuilds edges from `raw_calls` only: the old code kept raw
+   unqualified edges alongside resolved ones, and created external nodes
+   for ANY dotted call — including `self.helper` and `config.load` (a local
+   variable) — which polluted the graph and could false-match a target by
+   simple name. External nodes are now created only when the base is a
+   known import. Two bugs found while testing: the empty-module-node
+   cleanup ran before pass 2 (when edge sets are still empty) and deleted
+   live `<module>` nodes — it now runs after pass 2.
+
+### What is still NOT handled (honest limits)
+
+- `x = Loader(); x.load_config()` — variable type inference. Only direct
+  `Loader().load_config()` and `self.` are resolved. An unknown-object
+  method call is dropped, never guessed.
+- Calls inside a lambda are attributed to the enclosing function (fine),
+  but the lambda itself is not a node.
+- Decorator calls are not graph edges; route handlers are entry points
+  via Phase 3, not via the graph.
 
 ### Call graph — `callgraph.py`
 
@@ -213,12 +258,52 @@ Run: `python -m pytest tests/ -q`
 
 ---
 
-## Phase 3 — Real entry points, output, cache
+## Phase 3 — Real entry points, output, cache ✅ BUILT
 
 **Goal:** only real starts count, then write JSON + OpenVEX, and cache
 dependency parsing.
 **Files:** `pyreach/entrypoints.py`, `pyreach/vex.py`, `pyreach/cache.py`, `pyreach/cli.py`
 **Time:** hours 11-14. **BUILD NOW: this phase contains differentiator 3.**
+**Status: built, 18 Nov. 23 tests pass (was 15). All 15 fixtures correct.**
+
+### What Phase 3 hardening fixed
+
+1. **console_scripts now feed BFS roots**, not just evidence. A CLI tool
+   whose only entry is `pyproject [project.scripts]` fell back to "all
+   public functions", so `dead()` became an entry. Fixture: `app_console`
+   (only entry `app.run`, path never through `app.dead`).
+2. **Django urlpatterns:** `path("upload/", views.upload)` resolves the
+   view, preferring the views module. Fixture: `app_django`. Class-based
+   views (`MyView.as_view()`) are unsupported, not guessed.
+3. **Decorators:** `.put/.delete/.patch`, `click.group`, `.command(` added.
+   Fixture: `app_click` (regression, old code already handled click.command).
+4. **Library mode prefers `__all__`** in `__init__.py`, resolved to
+   qualified functions. Old code took all public functions, so an
+   unexported-but-public helper was an entry. Fixture: `app_library`
+   (only entry `pkg.lib.load_config`).
+5. **__main__ guard** prefers the same-module function; **__init__.py
+   public functions are entries only in library mode** (old code added
+   them in app mode too).
+6. **Cache is actually wired now** (`phase1.py` + `cli.py`). GitHub diffs
+   cache by `(repo, sha)` — the sha IS the content hash, so it can never
+   be stale. PyPI sdist diffs cache by `(package, old->new, sdist sha256)`.
+   Verified live: second `fetch PyYAML 5.3.1` is a cache hit, output
+   byte-identical; a later scan reports `{'hits': 1, 'misses': 0}`.
+   The cache key already included artifact hash + parser version
+   (ChatGPT fix); what was missing was any caller.
+7. **Report provenance:** `report.json` now has an `advisories` list
+   (id, package, fixed_version, fix commit sha, candidate count), so a
+   judge can reproduce the run from the report alone. Bug found: live
+   advisory `fix_commit` is a dict, `load_advisories()` now extracts
+   its sha.
+
+### Honest limits
+
+- `urls.<module>` shows up as an entry in the Django fixture (top-level
+  `path()` calls run on import). Correct, just noisy; the verdict and
+  the path are unaffected.
+- Class-based Django views are not resolved. `x = Loader(); x.method()`
+  is still unresolved (Phase 2 limit).
 
 ### 3a. Real entry points — `entrypoints.py` — BUILD NOW
 

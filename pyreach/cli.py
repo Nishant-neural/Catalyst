@@ -42,9 +42,12 @@ def main(argv=None) -> int:
         fp.add_argument("--out", default="advisories.json")
         fargs = fp.parse_args(argv[1:])
         print(f"fetching OSV for {fargs.package} {fargs.version} ...")
-        results = analyse_advisory_live(fargs.package, fargs.version)
+        # Phase 3: diffs are cached by commit sha / sdist sha256, so a
+        # second fetch of the same advisory is a cache hit, not a download.
+        cache = Cache(".reachcache")
+        results = analyse_advisory_live(fargs.package, fargs.version, cache=cache)
         save_advisories(results, fargs.out)
-        print(f"advisories: {len(results)}  -> {fargs.out}")
+        print(f"advisories: {len(results)}  -> {fargs.out}  (cache: {cache.hits} hits, {cache.misses} misses)")
         for r in results:
             fc = r.get("fix_commit") or {}
             print(f"  {r['id']} fixed={r.get('fixed_version')} commit={fc.get('sha', '')[:12] if fc.get('sha') else fc.get('via', 'none')}")
@@ -70,11 +73,12 @@ def main(argv=None) -> int:
         print(f"error: project not found: {root}", file=sys.stderr)
         return 1
 
+    cache = Cache(args.cache_dir)
     if args.advisory:
         advisories = load_advisories(args.advisory)
     elif args.package and args.version:
         print(f"Phase 1: fetching advisories for {args.package} {args.version} ...")
-        live = analyse_advisory_live(args.package, args.version)
+        live = analyse_advisory_live(args.package, args.version, cache=cache)
         # Write the live result next to the report so it is reproducible
         Path("_live_advisories.json").write_text(json.dumps(live, indent=2), encoding="utf-8")
         advisories = load_advisories("_live_advisories.json")
@@ -83,7 +87,6 @@ def main(argv=None) -> int:
     else:
         print("error: give --advisory <json> or --package <name> --version <ver>", file=sys.stderr)
         return 1
-    cache = Cache(args.cache_dir)
     graph = build_graph(root)
     entries, entry_note = find_entrypoints(root, graph)
     print(f"entry points ({entry_note}): {sorted(entries)}")
@@ -183,6 +186,14 @@ def main(argv=None) -> int:
     print(f"uncertain rate: {uncertain_rate:.0%} ({sum(1 for r in results if r.verdict == 'uncertain')}/{len(results)}) — a tool that labels everything uncertain gets 0 false not-reachable without solving anything, so report this metric.")
     report = {
         "project": str(root),
+        # Phase 3: provenance — which advisory, which fix commit, how many
+        # candidates, so a judge can reproduce the run from the report alone.
+        "advisories": [
+            {"id": a.id, "package": a.package, "fixed_version": a.fixed_version,
+             "fix_commit": a.fix_commit if isinstance(a.fix_commit, str) else "",
+             "candidates": len(a.vulnerable_functions)}
+            for a in advisories
+        ],
         "entry_note": entry_note,
         "entry_evidence": evidence,
         "completeness_ledger": ledger.to_dict(),

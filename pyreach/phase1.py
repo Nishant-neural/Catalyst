@@ -28,6 +28,7 @@ import re
 import requests
 
 from .advisory import Advisory, VulnerableFunction, diff_to_functions, names_from_text
+from .cache import Cache, cache_key
 
 OSV_URL = "https://api.osv.dev/v1/query"
 COMMIT_RE = re.compile(r"github\.com/([^/]+/[^/]+)/commit/([0-9a-f]{40})")
@@ -79,12 +80,21 @@ def find_fix_commit(advisory: Advisory) -> tuple[str, str] | None:
     return None
 
 
-def fetch_github_diff(repo: str, sha: str) -> str:
+def fetch_github_diff(repo: str, sha: str, cache: Cache | None = None) -> str:
     """Fetch a commit diff as text. No auth for public repos, rate-limited.
-    Uses the .diff endpoint, which needs no API token."""
+    Uses the .diff endpoint, which needs no API token.
+    Phase 3: cached by (repo, sha) — the sha IS the content hash, so a
+    cached diff can never be stale. First project pays, later ones reuse."""
+    if cache is not None:
+        key = cache_key(repo, sha, sha)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit["diff"]
     url = f"https://github.com/{repo}/commit/{sha}.diff"
     r = requests.get(url, headers={"User-Agent": "pyreach/0.1.0"}, timeout=30)
     r.raise_for_status()
+    if cache is not None:
+        cache.put(cache_key(repo, sha, sha), {"diff": r.text})
     return r.text
 
 
@@ -167,7 +177,7 @@ def module_level_candidates(diff_text: str, advisory_text: str) -> list[Vulnerab
     return list(seen.values())
 
 
-def analyse_advisory_live(package: str, version: str) -> list[dict]:
+def analyse_advisory_live(package: str, version: str, cache: Cache | None = None) -> list[dict]:
     """Full Phase 1 pipeline for one package@version. Returns a list of
     dicts, one per advisory, with fix commit, diff stats, and candidates.
     Each dict is JSON-serialisable and can be saved as an advisory file
@@ -188,7 +198,7 @@ def analyse_advisory_live(package: str, version: str) -> list[dict]:
             # (vulnerable version vs fixed version) instead.
             if adv.fixed_version:
                 try:
-                    diff = fetch_pypi_sdist_diff(package, version, adv.fixed_version)
+                    diff = fetch_pypi_sdist_diff(package, version, adv.fixed_version, cache=cache)
                     cands = diff_to_functions(diff, {}, commit="pypi-diff")
                     cands.extend(module_level_candidates(diff, adv.summary))
                     entry["fix_commit"] = {"repo": None, "sha": None, "via": "pypi-sdist-diff"}
@@ -216,7 +226,7 @@ def analyse_advisory_live(package: str, version: str) -> list[dict]:
         repo, sha = found
         entry["fix_commit"] = {"repo": repo, "sha": sha}
         try:
-            diff = fetch_github_diff(repo, sha)
+            diff = fetch_github_diff(repo, sha, cache=cache)
         except Exception as e:
             entry["candidates"] = [{
                 "qualified": "", "file": "", "confidence": "low",
@@ -259,20 +269,36 @@ def analyse_advisory_live(package: str, version: str) -> list[dict]:
     return results
 
 
-def fetch_pypi_sdist_diff(package: str, old_version: str, new_version: str) -> str:
+def fetch_pypi_sdist_diff(package: str, old_version: str, new_version: str,
+                          cache: Cache | None = None) -> str:
     """Fallback when there is no fix commit: download the sdist for the
     vulnerable version and the fixed version from PyPI, and diff matching
     .py files with difflib. Returns a unified-diff-like string.
-    This is slower than a GitHub diff and only used when no commit exists."""
+    This is slower than a GitHub diff and only used when no commit exists.
+    Phase 3: cached by (package, old->new, sdist sha256). The sha256 from
+    PyPI metadata is the artifact hash, so a cached diff can never be stale."""
     import difflib
     import io
     import tarfile
 
-    def sdist_files(version: str) -> dict[str, str]:
+    def sdist_meta(version: str):
         r = requests.get(f"https://pypi.org/pypi/{package}/{version}/json", timeout=30)
         r.raise_for_status()
         urls = r.json().get("urls", [])
         sdist = next((u for u in urls if u.get("packagetype") == "sdist"), None)
+        return sdist
+
+    if cache is not None:
+        old_meta, new_meta = sdist_meta(old_version), sdist_meta(new_version)
+        artifact = ((old_meta or {}).get("digests", {}).get("sha256", "") +
+                    (new_meta or {}).get("digests", {}).get("sha256", ""))
+        key = cache_key(package, f"{old_version}->{new_version}", "", artifact)
+        hit = cache.get(key)
+        if hit is not None:
+            return hit["diff"]
+
+    def sdist_files(version: str) -> dict[str, str]:
+        sdist = sdist_meta(version)
         if not sdist:
             return {}
         data = requests.get(sdist["url"], timeout=60).content
@@ -299,7 +325,14 @@ def fetch_pypi_sdist_diff(package: str, old_version: str, new_version: str) -> s
             fromfile=f"a/{path}", tofile=f"b/{path}", lineterm="",
         ))
         chunks.append("")
-    return "\n".join(chunks)
+    diff = "\n".join(chunks)
+    if cache is not None:
+        old_meta, new_meta = sdist_meta(old_version), sdist_meta(new_version)
+        artifact = ((old_meta or {}).get("digests", {}).get("sha256", "") +
+                    (new_meta or {}).get("digests", {}).get("sha256", ""))
+        cache.put(cache_key(package, f"{old_version}->{new_version}", "", artifact),
+                  {"diff": diff})
+    return diff
 
 
 def save_advisories(results: list[dict], path: str) -> None:
