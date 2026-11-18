@@ -41,11 +41,47 @@ Useful for CI.
 
 ---
 
-## Phase 1 — Advisory to vulnerable functions (from the fix commit)
+## Phase 1 — Advisory to vulnerable functions (from the fix commit) ✅ BUILT
 
 **Goal:** turn an alert into a list of vulnerable functions, with confidence.
-**Files:** `pyreach/advisory.py`
+**Files:** `pyreach/phase1.py` (live fetch), `pyreach/advisory.py` (diff mapping)
 **Time:** hours 2-6 in the 24h plan.
+**Status: built and tested live, 18 Nov.** Commands:
+`python3 -m pyreach.cli fetch PyYAML 5.3.1 --out examples/advisory-real-pyyaml.json`
+`python3 -m pyreach.cli scan fixtures/app_vuln --package PyYAML --version 5.3.1`
+Real result: GHSA-8q59-q68h-6hv4 (CVE-2020-14343), fixed 5.4, commit
+`a001f2782501`, 7 candidates, all medium confidence.
+
+### What live testing proved (and fixed)
+
+1. **The fix commit does NOT change the vulnerable function.** The PyYAML
+   fix moves multi-constructors from `FullConstructor` to `UnsafeConstructor`
+   at module level, outside any function. Mapping changed lines to functions
+   alone returns []. Candidates must also come from names in the removed
+   lines (`construct_python_object_new`, …), advisory text (`full_load`,
+   `FullLoader`), and test changes (`yaml.load(..., FullLoader)` →
+   `UnsafeLoader`, `yaml.full_load` → `yaml.unsafe_load`). Only REMOVED
+   lines are vulnerable code — added lines are the fix, so `UnsafeConstructor.*`
+   was wrongly listed as vulnerable in the first run and is now excluded.
+2. **Library internals must never be a false not_reachable** (`pyreach/reach.py`).
+   `FullConstructor.construct_python_object_new` is never called by project
+   code — the library calls it internally when you call `yaml.load`. So a
+   no-path BFS must not say not_reachable. It says uncertain, and
+   `propagate_library_internals()` upgrades it to reachable when `yaml.load`
+   is reachable. Test: `tests/test_reach_internal.py` (2 tests). On
+   `app_safe` the internals stay uncertain (honest: dependency source not
+   parsed), while `yaml.load` / `yaml.full_load` are still not_reachable.
+3. **OSV dedupes by alias.** GHSA-8q59-q68h-6hv4 and PYSEC-2021-142 are the
+   same CVE; `fetch_osv()` keeps the first and skips the alias.
+4. **PyPI sdist fallback works.** PYSEC had no fix commit in its references,
+   so `fetch_pypi_sdist_diff()` diffed PyYAML 5.3.1 vs 5.4 sdists and got the
+   same candidates. Used only when no commit exists.
+5. **OpenVEX is per result, not per run** (`pyreach/cli.py`). The old rule
+   blocked all VEX if any result was uncertain, so 3 uncertain internals
+   blocked VEX for `yaml.full_load`, which is provably not_reachable. Now
+   VEX is written per not_reachable result when the graph is clean (no
+   dynamic trigger, no ambiguous edge, project fully parsed). Uncertain
+   results never produce VEX.
 
 ### Steps
 

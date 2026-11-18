@@ -67,6 +67,48 @@ def _has_dynamic_near(graph: Graph, starts: set[str]) -> bool:
     return False
 
 
+def _is_library_internal(qualified: str) -> bool:
+    """True for functions the project never calls directly — the library
+    calls them internally. E.g. FullConstructor.construct_python_object_new.
+    Public APIs the project calls (yaml.load, yaml.full_load) are NOT internal.
+    Note: add_multi_constructor is the registration call, not a vulnerable
+    function — it is not internal either, it is just not a candidate."""
+    return "construct_" in qualified
+
+
+def _target_in_graph(graph: Graph, target: str) -> bool:
+    return any(t == target or t.endswith("." + target) or t.split(".")[-1] == target
+               for t in graph.functions)
+
+
+def propagate_library_internals(results: list[Result]) -> list[Result]:
+    """If a public loader (yaml.load / yaml.full_load) is reachable, then a
+    library-internal constructor it uses internally is reachable too, even
+    though the project never calls it directly and the dependency source
+    was not parsed. Without this, yaml.load reachable + construct_* 
+    not_reachable would be a false not-reachable — the worst failure."""
+    by_adv: dict[str, list[Result]] = {}
+    for r in results:
+        by_adv.setdefault(r.advisory_id, []).append(r)
+    for adv_id, rs in by_adv.items():
+        apis = [r for r in rs if r.verdict == "reachable"
+                and (r.vulnerable_function.endswith(".load")
+                     or r.vulnerable_function.endswith(".full_load")
+                     or r.vulnerable_function in ("load", "full_load"))]
+        if not apis:
+            continue
+        api = apis[0]
+        for r in rs:
+            if r.verdict == "uncertain" and _is_library_internal(r.vulnerable_function):
+                r.verdict = "reachable"
+                r.confidence = "medium"
+                r.path = list(api.path) + [r.vulnerable_function]
+                r.reason = (f"Reached inside the library via {api.vulnerable_function} "
+                            f"(library internal, dependency source not parsed): "
+                            f"{' -> '.join(r.path)}")
+    return results
+
+
 def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> list[Result]:
     results: list[Result] = []
     dynamic_near = _has_dynamic_near(graph, entrypoints)
@@ -91,6 +133,21 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
                     function_confidence=vf.confidence,
                 ))
                 continue
+            # No path, and the target is a library internal that the project
+            # never calls directly: we cannot prove not_reachable, because
+            # the dependency source was not parsed and the library may call
+            # it internally when a public API is used. Fail closed -> uncertain.
+            if _is_library_internal(vf.qualified) and not _target_in_graph(graph, vf.qualified):
+                results.append(Result(
+                    advisory_id=adv.id, package=adv.package,
+                    vulnerable_function=vf.qualified, verdict="uncertain",
+                    confidence="medium", path=[],
+                    reason="Library-internal function, dependency source not parsed; "
+                           "cannot prove not-reachable. Reachable if a public loader "
+                           "that uses it is reachable (see propagate_library_internals).",
+                    function_confidence=vf.confidence,
+                ))
+                continue
             # No path. Can we safely say not_reachable?
             if vf.confidence == "low":
                 verdict, conf = "uncertain", "low"
@@ -110,4 +167,4 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
                 confidence=conf, path=[], reason=reason,
                 function_confidence=vf.confidence,
             ))
-    return results
+    return propagate_library_internals(results)
