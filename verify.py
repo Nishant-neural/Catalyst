@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
-"""One-command verification for pyreach, Phases 1-5 + explainer.
+"""One-command verification for pyreach, Phases 1-5 + explainer + HTML report.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness + explain
+    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness + explain + quiet/HTML
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (85 tests) — the deterministic core + explainer
+  A. the unit suite (120 tests) — the deterministic core + explainer + HTML report + LLM status
   B. all 26 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
@@ -17,8 +17,14 @@ What it proves, in order:
      and never downgrades when the entry needs args (Phase 5)
   E. --explain explains uncertain results deterministically, with the
      footer, and `explain` replays them from an existing report
-  F. (--live) the real OSV -> fix-commit -> candidates pipeline
-     for PyYAML 5.3.1, the case Phase 1 was built on
+  F. quiet terminal (no line over ~500 chars, no evidence dump) and
+     the readable HTML report next to the JSON, regenerable with
+     `pyreach report`
+  H. `pyreach llm-test` with no key reports kind no_key, exit 1, and
+     prints no key value (the MkDocs diagnostic: a silent LLM failure
+     must name itself, not look like "not tried")
+  G. (--live) the real OSV -> fix-commit -> candidates pipeline
+     for PyYAML 5.3.1, the case Phase 1 was built on (runs last)
 """
 from __future__ import annotations
 
@@ -115,15 +121,15 @@ def main() -> int:
 
     print("A. unit tests")
     # pytest if present, else stdlib unittest (the tests are unittest
-    # TestCases, so both run the same 85 tests). pytest is not part of
+    # TestCases, so both run the same 120 tests). pytest is not part of
     # a default Python install, and a fresh VM may not have it.
     r = run(["-m", "pytest", "tests", "-q"])
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (85 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (120 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (85 tests)", r.returncode == 0,
+        check("pytest suite (120 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -188,6 +194,11 @@ def main() -> int:
           and 'config["func"]' in exps[0]["deterministic_explanation"]
           and exps[0]["llm_explanation"] is None
           and exps[0]["llm_rejected"] is False
+          # The diagnostic: with --no-llm the layer never ran, and the
+          # explanation must SAY so (llm_status "not_called"), not leave
+          # a bare null that looks like a silent failure.
+          and exps[0].get("llm_status") == "not_called"
+          and exps[0].get("llm_error") is None
           and exps[0]["does_not_know"]
           and exps[0]["evidence_pack_tokens"] <= 1500
           and r.returncode == 0,
@@ -205,8 +216,50 @@ def main() -> int:
           (rep or {}).get("explanations") == [] and r.returncode == 2,
           f"explanations={(rep or {}).get('explanations')} exit={r.returncode}")
 
+    print("F. quiet terminal + readable HTML report (19 Nov 2026 fix)")
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_getattr_config",
+             "--advisory", ADV, "--explain", "--no-llm",
+             "--out", str(tmp / "f.json"), "--cache-dir", str(tmp / "cache")])
+    longest = max((len(ln) for ln in r.stdout.splitlines()), default=0)
+    html_path = tmp / "f.html"
+    page = html_path.read_text() if html_path.exists() else ""
+    rep = _read_report(tmp / "f.json")
+    check("quiet scan: no line over 500 chars, no evidence dump, HTML written",
+          longest < 500 and "entry evidence: {" not in r.stdout
+          and "explain [uncertain] yaml.load" in r.stdout
+          and html_path.exists() and "yaml.load" in page
+          and "The verdict remains UNCERTAIN" in page
+          and (rep or {}).get("html_report") == "f.html"
+          and r.returncode == 0,
+          f"longest={longest} html_exists={html_path.exists()} exit={r.returncode}")
+    r = run(["-m", "pyreach.cli", "report", "--report", str(tmp / "f.json"),
+             "--out", str(tmp / "f-regen.html")])
+    regen = (tmp / "f-regen.html").read_text() if (tmp / "f-regen.html").exists() else ""
+    check("pyreach report regenerates HTML from an existing report.json",
+          r.returncode == 0 and "yaml.load" in regen,
+          r.stdout[-200:] + r.stderr[-200:])
+
+    print("H. llm-test diagnosis with no key (no network call)")
+    # Run in the temp dir (no .env there) with any key stripped from
+    # the environment, so this check is offline and cannot leak a key:
+    # a real key in the parent environment must not make this test
+    # attempt a live call, and must not appear in the output.
+    import os as _os
+    clean_env = {k: v for k, v in _os.environ.items()
+                 if k not in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "LLM_BASE_URL")}
+    # cwd=tmp so no .env is found by the walk-up; PYTHONPATH=ROOT so
+    # `python -m pyreach.cli` still resolves from the temp dir.
+    clean_env["PYTHONPATH"] = str(ROOT)
+    r = subprocess.run([sys.executable, "-m", "pyreach.cli", "llm-test"],
+                       cwd=tmp, capture_output=True, text=True,
+                       timeout=60, env=clean_env)
+    check("llm-test with no key: kind no_key, exit 1, no key printed",
+          r.returncode == 1 and "no_key" in r.stdout
+          and "sk-" not in r.stdout and "sk-" not in r.stderr,
+          f"exit={r.returncode} stdout={r.stdout[-200:]!r} stderr={r.stderr[-200:]!r}")
+
     if live:
-        print("F. live OSV fetch (network)")
+        print("G. live OSV fetch (network)")
         out = tmp / "live-advisories.json"
         r = run(["-m", "pyreach.cli", "fetch", "PyYAML", "5.3.1",
                  "--out", str(out)])

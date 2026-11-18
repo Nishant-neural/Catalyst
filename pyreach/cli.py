@@ -28,9 +28,11 @@ from .completeness import Ledger
 from .debate import format_pr_comment
 from .entrypoints import find_entrypoints, find_entrypoints_with_evidence
 from .explainer import explain_result, format_explanation
+from .html_report import blocked_location, html_path_for, render_report_file, write_html_report
 from .proof import run_execution_proof
 from .reach import Result, analyze
-from .resolver import DEFAULT_MODEL, build_prompt, resolve_getattr_case
+from .resolver import (DEFAULT_MODEL, LLM_TEST_PROMPT, build_prompt,
+                       resolve_getattr_case, resolve_with_llm_status)
 from .vex import build_openvex, write_openvex
 
 
@@ -59,6 +61,49 @@ def llm_key_present() -> bool:
                 or os.environ.get("GROQ_API_KEY"))
 
 
+def llm_explainer_summary(explanations: list[dict]) -> str:
+    """One summary line for the LLM explainer layer, e.g.
+    "LLM explainer: 3 called, 0 accepted, 0 rejected, 3 unavailable (timeout)".
+
+    "called" counts every explanation where the layer actually ran
+    (llm_status != "not_called"); "accepted" is llm_status "ok";
+    "rejected" is verifier-rejected; the rest are unavailable, with
+    the distinct failure kinds in parentheses, most common first.
+    """
+    from collections import Counter
+    called = accepted = rejected = 0
+    unavailable: Counter = Counter()
+    for e in explanations:
+        status = e.get("llm_status", "not_called")
+        if status == "not_called":
+            continue
+        called += 1
+        if e.get("llm_explanation"):
+            accepted += 1
+        elif e.get("llm_rejected"):
+            rejected += 1
+        else:
+            unavailable[status] += 1
+    unav = sum(unavailable.values())
+    line = (f"LLM explainer: {called} called, {accepted} accepted, "
+            f"{rejected} rejected, {unav} unavailable")
+    if unavailable:
+        kinds = ", ".join(k for k, _ in unavailable.most_common())
+        line += f" ({kinds})"
+    return line
+
+
+def _print_llm_debug(explanations: list[dict]) -> None:
+    """Per-result LLM status + safe detail, for --llm-debug only."""
+    for e in explanations:
+        status = e.get("llm_status", "not_called")
+        detail = e.get("llm_error")
+        line = f"LLM debug {e.get('vulnerable_function', '?')}: {status}"
+        if detail:
+            line += f" — {detail}"
+        print(line)
+
+
 def should_use_llm(with_llm: bool, no_llm: bool, key_present: bool) -> bool:
     """Decide whether the Phase 4 LLM resolver may run.
 
@@ -71,6 +116,20 @@ def should_use_llm(with_llm: bool, no_llm: bool, key_present: bool) -> bool:
     if no_llm:
         return False
     return bool(with_llm or key_present)
+
+
+def resolve_model_choice(explicit_model: str | None) -> tuple[str, bool]:
+    """Turn a --model flag into (model, allow_fallback).
+
+    The --model arguments default to None so "not given" can be told
+    apart from "given": no --model means the default model WITH the
+    free-model fallback chain (a delisted default 404 falls back);
+    an explicit --model means exactly that model, no fallback — the
+    user's explicit choice is not ours to override.
+    """
+    if explicit_model is None:
+        return DEFAULT_MODEL, True
+    return explicit_model, False
 
 
 def main(argv=None) -> int:
@@ -120,8 +179,12 @@ def main(argv=None) -> int:
                         help="Also run the LLM explainer layer (auto-enabled when a key is in .env)")
         ep.add_argument("--no-llm", action="store_true",
                         help="Deterministic explanations only, even with a key present")
-        ep.add_argument("--model", default=DEFAULT_MODEL)
+        ep.add_argument("--model", default=None,
+                        help="LLM model (default: cohere/north-mini-code:free; "
+                             "explicit --model is used exactly, with no fallback)")
         ep.add_argument("--env-file", default=None)
+        ep.add_argument("--llm-debug", action="store_true",
+                        help="Also print the per-result LLM status and safe detail")
         eargs = ep.parse_args(argv[1:])
         _report_dotenv(load_dotenv_file(path=eargs.env_file))
         try:
@@ -141,6 +204,7 @@ def main(argv=None) -> int:
                   f"explanations are grounded in the project you passed, "
                   f"not the one the report was scanned from")
         use_llm = should_use_llm(eargs.with_llm, eargs.no_llm, llm_key_present())
+        model, allow_fallback = resolve_model_choice(eargs.model)
         if use_llm and not eargs.with_llm:
             print("LLM: key found, explainer layer on (use --no-llm to skip it)")
         cache = Cache(".reachcache")
@@ -156,6 +220,7 @@ def main(argv=None) -> int:
         if not rows:
             print("no uncertain results to explain.")
             return 0
+        exps = []
         for r in rows:
             adv = adv_by_id.get(r.get("advisory_id"), {}) or {}
             res = Result(advisory_id=r.get("advisory_id", ""),
@@ -169,10 +234,75 @@ def main(argv=None) -> int:
                 res, graph, root,
                 {"id": r.get("advisory_id", ""), "package": r.get("package", ""),
                  "fixed_version": adv.get("fixed_version", "")},
-                entries, use_llm=use_llm, model=eargs.model, cache=cache)
+                entries, use_llm=use_llm, model=model, cache=cache,
+                allow_fallback=allow_fallback)
+            exps.append(exp)
             print(format_explanation(exp))
             print()
+        print(llm_explainer_summary(exps))
+        if eargs.llm_debug:
+            _print_llm_debug(exps)
         return 0
+
+    # Report command: pyreach report --report report.json [--out report.html]
+    # Renders the readable HTML interface from an existing report.json
+    # without re-scanning — e.g. for a report produced before the HTML
+    # output existed. Exit 0 on success, clean error otherwise.
+    if argv and argv[0] == "report":
+        rp = argparse.ArgumentParser(
+            prog="pyreach report",
+            description="Render an existing report.json as readable HTML")
+        rp.add_argument("--report", required=True, help="report.json from a scan")
+        rp.add_argument("--out", default=None,
+                        help="HTML output (default: <report>.html, same directory)")
+        rargs = rp.parse_args(argv[1:])
+        try:
+            out = render_report_file(rargs.report, rargs.out)
+        except FileNotFoundError:
+            print(f"error: report not found: {rargs.report}", file=sys.stderr)
+            return 1
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"error: cannot read report {rargs.report}: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {out} (open it in a browser)")
+        return 0
+
+    # LLM diagnosis: pyreach llm-test [--model <model>]
+    # One minimal call, no scan. Run this FIRST when the LLM layer
+    # looks dead: it tells you whether the key, the endpoint, or the
+    # model is the problem, instead of a full MkDocs scan telling you
+    # nothing. Prints key presence only, never the value. Exit 0 on
+    # ok, 1 otherwise. No cache: a cached ok would hide a dead endpoint.
+    if argv and argv[0] == "llm-test":
+        tp = argparse.ArgumentParser(
+            prog="pyreach llm-test",
+            description="One-call LLM diagnosis: key, endpoint and model, no scan")
+        tp.add_argument("--model", default=None,
+                        help="LLM model (default: cohere/north-mini-code:free; "
+                             "explicit --model is used exactly, with no fallback)")
+        tp.add_argument("--env-file", default=None)
+        targs = tp.parse_args(argv[1:])
+        _report_dotenv(load_dotenv_file(path=targs.env_file))
+        print(f"LLM key: {'present' if llm_key_present() else 'missing (set OPENROUTER_API_KEY in .env or the environment)'}")
+        model, allow_fallback = resolve_model_choice(targs.model)
+        import time
+        t0 = time.monotonic()
+        ans, status = resolve_with_llm_status(LLM_TEST_PROMPT,
+                                              model=model, cache=None,
+                                              allow_fallback=allow_fallback)
+        dt = time.monotonic() - t0
+        used = status.get("model") or model
+        if ans is not None and isinstance(ans, dict) and ans.get("ok") is True:
+            print(f"LLM test: ok in {dt:.2f}s (model {used})")
+            return 0
+        if ans is not None:
+            kind, detail = "bad_json", 'model replied but not the expected {"ok": true} JSON'
+        else:
+            kind = status.get("kind", "network_error")
+            detail = status.get("detail") or ""
+        print(f"LLM test: {kind}" + (f" — {detail}" if detail else "")
+              + f" (model {used})")
+        return 1
 
     p = argparse.ArgumentParser(prog="pyreach", description="Which vuln alerts actually affect this Python project?")
     p.add_argument("command", choices=["scan"])
@@ -184,11 +314,17 @@ def main(argv=None) -> int:
     p.add_argument("--vex", default="openvex.json", help="OpenVEX output (only for not_reachable)")
     p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (also auto-enabled when a key is in .env / the environment)")
     p.add_argument("--no-llm", action="store_true", help="Never run the LLM resolver, even if a key is in .env / the environment")
-    p.add_argument("--model", default=DEFAULT_MODEL, help="LLM model for the resolver (default: openai/gpt-oss-20b)")
+    p.add_argument("--model", default=None, help="LLM model for the resolver (default: cohere/north-mini-code:free; explicit --model is used exactly, with no fallback)")
     p.add_argument("--print-prompt", action="store_true", help="Print the grounded LLM prompt for uncertain cases and exit without calling any model (demo without a key)")
     p.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
     p.add_argument("--explain", action="store_true",
                    help="Explain every uncertain result (deterministic first; LLM layer only if a key is present and --no-llm is not given)")
+    p.add_argument("--verbose", action="store_true",
+                   help="Print the full terminal dump (full entry-point list, full entry evidence, full explanation text). Default is a short summary only.")
+    p.add_argument("--no-html", action="store_true",
+                   help="Do not write the readable HTML report next to report.json")
+    p.add_argument("--llm-debug", action="store_true",
+                   help="Also print the per-result LLM status and safe detail (with --explain)")
     p.add_argument("--proof-timeout", type=int, default=10, help="Seconds per witness run (default 10)")
     p.add_argument("--cache-dir", default=".reachcache")
     p.add_argument("--env-file", default=None,
@@ -208,6 +344,9 @@ def main(argv=None) -> int:
     # The .env case: a key in .env IS the request to use the LLM, so a
     # plain `scan` (no --with-llm) uses it. --no-llm always wins.
     use_llm = should_use_llm(args.with_llm, args.no_llm, llm_key_present())
+    # No --model: default model WITH the free-model fallback chain.
+    # Explicit --model: exactly that model, no fallback.
+    model, allow_fallback = resolve_model_choice(args.model)
     if use_llm and not args.with_llm:
         via = ".env" if any(k in dotenv_summary.get("loaded", [])
                             for k in ("OPENROUTER_API_KEY", "GROQ_API_KEY")) else "the environment"
@@ -232,7 +371,13 @@ def main(argv=None) -> int:
         return 1
     graph = build_graph(root)
     entries, entry_note = find_entrypoints(root, graph)
-    print(f"entry points ({entry_note}): {sorted(entries)}")
+    # Quiet by default: the terminal is a summary, not a dump. A full
+    # entry-point list on a real project is 1,194 names on one line
+    # (MkDocs, 19 Nov 2026) — it belongs in report.json, not stdout.
+    if args.verbose:
+        print(f"entry points ({entry_note}): {sorted(entries)}")
+    else:
+        print(f"entry points ({entry_note}): {len(entries)}")
     print(f"functions: {len(graph.functions)}, edges: {sum(len(v) for v in graph.edges.values())}, dynamic triggers: {len(graph.dynamic)}")
 
     results = analyze(advisories, graph, entries)
@@ -248,7 +393,12 @@ def main(argv=None) -> int:
         vulnerable_targets_low=sum(1 for a in advisories for f in a.vulnerable_functions if f.confidence == "low"),
     )
     evidence = find_entrypoints_with_evidence(root, graph)
-    print(f"entry evidence: {evidence}")
+    # Same rule: the whole evidence dict (1,194 entries on MkDocs) is
+    # in report.json as entry_evidence; the terminal gets a count.
+    if args.verbose:
+        print(f"entry evidence: {evidence}")
+    else:
+        print(f"entry evidence: {len(evidence)} entries (see report.json)")
     print(f"completeness: {ledger.to_dict()}")
 
     # Phase 4: deterministic constant propagation FIRST, LLM only for
@@ -295,7 +445,8 @@ def main(argv=None) -> int:
                 continue
             outcome = resolve_getattr_case(
                 src, d["line"], [r.vulnerable_function], set(graph.functions),
-                cache=cache, model=args.model, allow_llm=use_llm)
+                cache=cache, model=model, allow_llm=use_llm,
+                allow_fallback=allow_fallback)
             if outcome is None:
                 unresolved += 1
                 continue
@@ -369,7 +520,8 @@ def main(argv=None) -> int:
                 r, graph, root,
                 {"id": r.advisory_id, "package": r.package,
                  "fixed_version": adv.fixed_version if adv else ""},
-                entries, use_llm=use_llm, model=args.model, cache=cache)
+                entries, use_llm=use_llm, model=model, cache=cache,
+                allow_fallback=allow_fallback)
             explanations.append({
                 "vulnerable_function": exp["vulnerable_function"],
                 "advisory_id": exp["advisory_id"],
@@ -377,14 +529,46 @@ def main(argv=None) -> int:
                 "deterministic_explanation": exp["deterministic_explanation"],
                 "llm_explanation": exp["llm_explanation"],
                 "llm_rejected": exp["llm_rejected"],
+                # The diagnostic: what the LLM layer actually did for
+                # this result (ok / rejected / no_key / timeout /
+                # rate_limited / ... / not_called). llm_enabled only
+                # proves a key was found, never that a call succeeded.
+                "llm_status": exp.get("llm_status", "not_called"),
+                "llm_error": exp.get("llm_error"),
+                # Which model produced (or was last tried for) this
+                # explanation — not always the default, when the
+                # fallback chain switched models on a delisted 404.
+                "llm_model": exp.get("llm_model"),
                 "discriminating_check": exp["discriminating_check"],
                 "does_not_know": exp["does_not_know"],
                 "evidence_pack_tokens": exp["evidence_pack_tokens"],
             })
-            print()
-            print(format_explanation(exp))
+            # Quiet by default: ONE line per uncertain result. The full
+            # explanation text (deterministic + LLM layer) is in
+            # report.json and in the HTML report — printing it all made
+            # a MkDocs scan ~240KB of terminal output. --verbose
+            # restores the old full dump for debugging.
+            if args.verbose:
+                print()
+                print(format_explanation(exp))
+            else:
+                loc = blocked_location(exp["deterministic_explanation"])
+                print(f"explain [uncertain] {exp['vulnerable_function']} — "
+                      f"blocker {exp['blocker']}"
+                      + (f", blocked at {loc}" if loc else "")
+                      + f" (full explanation in {html_path_for(args.out).name})")
+        # One line saying what the LLM layer actually did. Before this
+        # fix, llm_explanation null + llm_rejected false looked like
+        # "rejected" or "not tried" — it was neither: the call itself
+        # had failed silently (no key / timeout / 429 / bad JSON).
+        if explanations:
+            print(llm_explainer_summary(explanations))
+            if args.llm_debug:
+                _print_llm_debug(explanations)
+    html_name = None if args.no_html else html_path_for(args.out).name
     report = {
         "project": str(root),
+        "html_report": html_name,
         # Phase 3: provenance — which advisory, which fix commit, how many
         # candidates, so a judge can reproduce the run from the report alone.
         "advisories": [
@@ -410,6 +594,12 @@ def main(argv=None) -> int:
         "pr_comments": [format_pr_comment(r, entry_note) for r in results],
     }
     Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    # Readable HTML interface, written next to the JSON report unless
+    # --no-html was given. It renders report.json data only, so it can
+    # be regenerated later with `pyreach report --report <report.json>`.
+    html_out = None
+    if not args.no_html:
+        html_out = write_html_report(report, args.out)
     # OpenVEX, per result, not per run (Phase 1 fix).
     # The old rule blocked ALL VEX if any result was uncertain — one
     # uncertain library-internal candidate (e.g. construct_python_object_new,
@@ -428,6 +618,8 @@ def main(argv=None) -> int:
     vex = build_openvex(vex_results, root.name)
     write_openvex(args.vex, vex)
     print(f"\nwrote {args.out} and {args.vex}")
+    if html_out is not None:
+        print(f"readable report: {html_out} (open it in a browser)")
     for r in results:
         print(f"  {r.verdict:13} {r.confidence:6} {r.advisory_id} {r.vulnerable_function}  {r.reason[:110]}")
     print(f"OpenVEX statements: {len(vex['statements'])} (not_reachable only)")

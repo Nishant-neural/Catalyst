@@ -5,9 +5,9 @@ at a time, with grounded context. It proposes, the verifier decides.
 If verification fails, stay UNCERTAIN. Never downgrade a deterministic
 REACHABLE verdict.
 
-Model: small open-weight, gpt-oss 20B or Llama 3.1 8B, via a free provider
-(OpenRouter / Groq). Temperature 0. No API key -> resolver is skipped,
-verdicts stay uncertain. That is safe.
+Model: small open-weight, via a free provider (OpenRouter / Groq).
+Temperature 0. No API key -> resolver is skipped, verdicts stay
+uncertain. That is safe.
 """
 from __future__ import annotations
 
@@ -15,12 +15,61 @@ import json
 import os
 import re
 
-DEFAULT_MODEL = "openai/gpt-oss-20b:free"
-# The :free suffix matters: openai/gpt-oss-20b without it is the paid
-# variant on OpenRouter. The free tier needs the :free model id, and
-# even then it is rate-limited (tens to a couple hundred requests/day).
-# Without a key the resolver is never called at all.
+# Default model, verified 19 Nov 2026 against the live OpenRouter
+# catalog (GET /api/v1/models, 0/0 pricing). The previous default,
+# openai/gpt-oss-20b:free, was DELISTED: on 19 Nov 2026 a real
+# `pyreach llm-test` on the user's machine got HTTP 404 "This model
+# is unavailable for free. The paid version is available now - use
+# this slug instead: openai/gpt-oss-20b". The live catalog that day
+# had NO gpt-oss :free slug at all — only the paid ones. Do NOT switch
+# the default to the paid slug openai/gpt-oss-20b: that would bill the
+# user for every scan. The :free suffix matters: without it, the model
+# id is the paid variant. Free slugs churn every few weeks — re-check
+# this default against GET /api/v1/models before trusting it, and see
+# FREE_MODEL_FALLBACKS below for what happens when one disappears.
+# Why cohere/north-mini-code:free: a code-focused model (best fit for
+# pyreach's small JSON code-reasoning prompts), it answered all 3
+# passes in a 3 Nov 2026 probe of free models, and it was in the live
+# 0/0-pricing catalog on 19 Nov 2026.
+DEFAULT_MODEL = "cohere/north-mini-code:free"
+# Free-model fallback chain, default first. Hard-pinning ONE free slug
+# is what broke on 19 Nov 2026 (see DEFAULT_MODEL above), so when the
+# default 404s as "unavailable for free" the call tries the next model
+# instead of failing the whole scan. Only that specific 404 triggers a
+# switch — 429 / timeout / bad JSON / network errors do not. An
+# explicitly passed --model is never overridden: see allow_fallback.
+FREE_MODEL_FALLBACKS = ["cohere/north-mini-code:free",
+                        "google/gemma-4-31b-it:free",
+                        "nvidia/nemotron-3.5-lightning:free"]
 CONFIDENCE_THRESHOLD = 0.8  # starting value, tune on organisers' fixtures
+LLM_TIMEOUT = 60  # seconds per LLM call
+
+# Kinds an LLM call can end in. "ok" means a parsed JSON answer came
+# back (it may still fail the verifier downstream — that is "rejected",
+# recorded by the explainer, not here). Every other kind means no
+# answer at all, and the detail says why in one safe line.
+LLM_STATUS_KINDS = ("ok", "no_key", "no_requests", "timeout", "http_error",
+                    "rate_limited", "bad_json", "network_error")
+
+# The one-call diagnosis prompt for `pyreach llm-test`: the model must
+# reply with exactly this JSON and nothing else.
+LLM_TEST_PROMPT = 'Reply with exactly this JSON and nothing else: {"ok": true}'
+
+
+def _safe_detail(text: str) -> str:
+    """One safe line for a status detail: never a key, never a body.
+
+    Redacts anything shaped like an API key or a Bearer token, collapses
+    whitespace, and truncates to ~120 characters. Use for every detail
+    that could carry provider text — an error message, a status line.
+    """
+    if not text:
+        return ""
+    text = re.sub(r"sk-or-v1-[A-Za-z0-9_\-]{4,}", "[REDACTED]", text)
+    text = re.sub(r"sk-[A-Za-z0-9]{8,}", "[REDACTED]", text)
+    text = re.sub(r"Bearer\s+\S+", "Bearer [REDACTED]", text)
+    text = re.sub(r"(?i)(api[_-]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", text)
+    return " ".join(str(text).split())[:120] or ""
 
 
 def build_prompt(call_site_source: str, candidates: list[str],
@@ -251,24 +300,166 @@ def constant_propagate_getattr(source: str, call_line: int) -> list[str] | None:
     return None
 
 
-def resolve_with_llm(prompt: str, api_key: str | None = None,
-                     model: str = DEFAULT_MODEL, cache=None) -> dict | None:
-    """Call a free OpenRouter-compatible endpoint. Returns parsed JSON or None.
+def _cache_key(prompt: str, model: str) -> str:
+    """One cache key per (model, prompt): a fallback hit is stored under
+    the fallback model's key, never under the default's."""
+    import hashlib
+    return f"llm:{model}:{hashlib.sha256(prompt.encode()).hexdigest()[:16]}"
 
+
+def _cached_answer(prompt: str, model: str, cache):
+    """Cached answer for one model, or None. No network, no key needed."""
+    if cache is None:
+        return None
+    hit = cache.get(_cache_key(prompt, model))
+    return hit.get("answer") if hit is not None else None
+
+
+def _attempt_llm_call(prompt: str, model: str, key: str, cache=None,
+                      base: str | None = None) -> tuple[dict | None, dict, bool]:
+    """One model, one POST. Returns (answer_or_None, status, delisted).
+
+    status is {"kind", "detail", "model"}: "model" is the model that
+    produced the answer, or the model that was tried on failure.
+    "delisted" is True only for the specific OpenRouter 404 whose body
+    says the model is "unavailable for free" — the 19 Nov 2026
+    gpt-oss-20b:free case. Only a delisted 404 may trigger a fallback
+    to the next model; every other failure ends the call here.
+    The cache key includes the model, so a fallback hit never poisons
+    the default model's cache entry (and vice versa).
+    """
+    # No cache lookup here: resolve_with_llm_status already checked
+    # the whole chain's cache before the network loop, so re-checking
+    # would double-count misses in the cache stats. This function only
+    # POSTs, and stores a fresh answer under this model's key.
+    cache_key = _cache_key(prompt, model) if cache is not None else None
+    if base is None:
+        base = os.environ.get("LLM_BASE_URL",
+                              "https://openrouter.ai/api/v1/chat/completions")
+    import requests
+    try:
+        r = requests.post(base, headers={"Authorization": f"Bearer {key}"},
+                          json={"model": model, "temperature": 0,
+                                "messages": [{"role": "user", "content": prompt}]},
+                          timeout=LLM_TIMEOUT)
+        r.raise_for_status()
+        try:
+            body = r.json()
+            content = body["choices"][0]["message"]["content"]
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            return None, {"kind": "bad_json",
+                          "detail": "response was not the expected JSON "
+                                    f"shape ({_safe_detail(str(e))})",
+                          "model": model}, False
+        if not isinstance(content, str):
+            return None, {"kind": "bad_json",
+                          "detail": "response content was not text",
+                          "model": model}, False
+        # Strip code fences if present
+        content = re.sub(r"^```(?:json)?\s*", "", content.strip())
+        content = re.sub(r"\s*```$", "", content.strip())
+        try:
+            ans = json.loads(content)
+        except ValueError as e:
+            return None, {"kind": "bad_json",
+                          "detail": "model reply was not JSON "
+                                    f"({_safe_detail(str(e))})",
+                          "model": model}, False
+        if cache is not None and cache_key is not None:
+            cache.put(cache_key, {"answer": ans})
+        return ans, {"kind": "ok", "detail": "", "model": model}, False
+    except Exception as e:
+        # Classify by exception type/name, not by message text: the
+        # requests classes may be absent, and a message could in
+        # principle echo a header. Order matters: HTTPError is also a
+        # RequestException, and Timeout must be checked before the
+        # generic network bucket.
+        name = type(e).__name__
+        status_code = getattr(getattr(e, "response", None), "status_code", None)
+        if name == "Timeout" or "Timeout" in name:
+            return None, {"kind": "timeout",
+                          "detail": f"request timed out after {LLM_TIMEOUT}s",
+                          "model": model}, False
+        if name == "HTTPError" or status_code is not None:
+            if status_code == 429:
+                return None, {"kind": "rate_limited",
+                              "detail": "HTTP 429: free-tier rate limit "
+                                        "reached — wait and retry",
+                              "model": model}, False
+            body = ""
+            try:
+                body = getattr(e.response, "text", "") or ""
+            except Exception:
+                body = ""
+            detail = f"HTTP {status_code}" if status_code else "HTTP error"
+            if body:
+                detail += f": {_safe_detail(body)}"
+            # The delisting signal, and only this one, authorises a
+            # fallback: OpenRouter 404 + "unavailable for free" in the
+            # body. Any other 404 (wrong endpoint, bad path) is not a
+            # delisting and must not switch models.
+            delisted = (status_code == 404
+                        and "unavailable for free" in body.lower())
+            return None, {"kind": "http_error", "detail": detail,
+                          "model": model}, delisted
+        if name in ("ConnectionError", "ConnectTimeout", "ReadTimeout") \
+                or "Connection" in name:
+            return None, {"kind": "network_error",
+                          "detail": "could not reach the LLM endpoint "
+                                    f"({_safe_detail(str(e))})",
+                          "model": model}, False
+        return None, {"kind": "network_error",
+                      "detail": _safe_detail(f"{name}: {e}") or name,
+                      "model": model}, False
+
+
+def resolve_with_llm_status(prompt: str, api_key: str | None = None,
+                            model: str = DEFAULT_MODEL, cache=None,
+                            allow_fallback: bool = True
+                            ) -> tuple[dict | None, dict]:
+    """Call a free OpenRouter-compatible endpoint, reporting WHY.
+
+    Returns (answer_or_None, status) where status is
+    {"kind": one of LLM_STATUS_KINDS, "detail": safe one-line string
+    or "", "model": the model that produced the answer, or the last
+    model tried on failure}. This is the one place that talks to the
+    endpoint — resolve_with_llm below is a thin wrapper over it, so
+    the two cannot drift apart.
+
+    Free-model fallback: when allow_fallback is True and the model is
+    the default, a 404 that says the model is "unavailable for free"
+    tries the next model in FREE_MODEL_FALLBACKS (delisted slugs are
+    how free models die — 19 Nov 2026). No other failure triggers a
+    switch. When the caller passed a model explicitly (allow_fallback
+    False), exactly that model is used, delisted or not: an explicit
+    choice is the user's, not ours to override.
     Set OPENROUTER_API_KEY or GROQ_API_KEY — as a real env var, or in a
     .env file in the current directory (see pyreach/dotenv.py). No key
-    -> None (stay uncertain).
-    This function is intentionally small; swap the endpoint in one place.
+    -> (None, no_key). A cache hit returns the stored answer with kind
+    "ok" and detail "cached answer", and makes no network call.
     Phase 4: answers are cached by (model, sha256(prompt)) in the same
     .reachcache as Phase 3, so a re-scan does not re-spend an LLM call.
     The cache key includes the model, so a model change is a miss.
+    The detail never contains the key or a response body: at most the
+    HTTP status code plus ~120 chars of an error message, key redacted.
     """
-    import hashlib
+    if allow_fallback and model == DEFAULT_MODEL:
+        chain = list(FREE_MODEL_FALLBACKS)
+    else:
+        chain = [model]
+    # Cache first, across the whole chain, before any key check or
+    # network call: a previous run may have fallen back, and its answer
+    # is cached under the fallback model's key. Without this pre-check
+    # a repeat call would 404 on the (delisted) default before ever
+    # reaching the cached fallback answer — spending a call to learn
+    # what the cache already knows. A cache hit needs no key at all,
+    # exactly as before.
     if cache is not None:
-        key = f"llm:{model}:{hashlib.sha256(prompt.encode()).hexdigest()[:16]}"
-        hit = cache.get(key)
-        if hit is not None:
-            return hit.get("answer")
+        for cached_model in chain:
+            cached = _cached_answer(prompt, cached_model, cache)
+            if cached is not None:
+                return cached, {"kind": "ok", "detail": "cached answer",
+                                "model": cached_model}
     key = api_key or os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not key:
         # Library callers bypass cli.py, so try ./.env here too. This is
@@ -278,35 +469,55 @@ def resolve_with_llm(prompt: str, api_key: str | None = None,
         load_dotenv_file()
         key = os.environ.get("OPENROUTER_API_KEY") or os.environ.get("GROQ_API_KEY")
     if not key:
-        return None
+        return None, {"kind": "no_key",
+                      "detail": "no OPENROUTER_API_KEY or GROQ_API_KEY "
+                                "in the environment or .env",
+                      "model": chain[0]}
     try:
-        import requests
+        import requests  # noqa: F401  (presence check only)
     except ImportError:
-        return None
+        return None, {"kind": "no_requests",
+                      "detail": "requests is not installed "
+                                "(pip install requests)",
+                      "model": chain[0]}
     base = os.environ.get("LLM_BASE_URL", "https://openrouter.ai/api/v1/chat/completions")
-    try:
-        r = requests.post(base, headers={"Authorization": f"Bearer {key}"},
-                          json={"model": model, "temperature": 0,
-                                "messages": [{"role": "user", "content": prompt}]},
-                          timeout=60)
-        r.raise_for_status()
-        content = r.json()["choices"][0]["message"]["content"]
-        # Strip code fences if present
-        content = re.sub(r"^```(?:json)?\s*", "", content.strip())
-        content = re.sub(r"\s*```$", "", content.strip())
-        ans = json.loads(content)
-        if cache is not None:
-            cache.put(f"llm:{model}:{hashlib.sha256(prompt.encode()).hexdigest()[:16]}",
-                      {"answer": ans})
-        return ans
-    except Exception:
-        return None
+    last_status: dict | None = None
+    for tried in chain:
+        ans, status, delisted = _attempt_llm_call(prompt, tried, key,
+                                                  cache=cache, base=base)
+        if ans is not None:
+            return ans, status
+        last_status = status
+        if not delisted:
+            return None, status
+        # Delisted 404: try the next model in the chain, if any.
+    assert last_status is not None
+    return None, last_status
+
+
+def resolve_with_llm(prompt: str, api_key: str | None = None,
+                     model: str = DEFAULT_MODEL, cache=None,
+                     allow_fallback: bool = True) -> dict | None:
+    """Call a free OpenRouter-compatible endpoint. Returns parsed JSON or None.
+
+    Kept exactly as before for existing callers: None means "no answer"
+    — no key, timeout, HTTP error, bad JSON, or network error all look
+    identical here. Callers that need to know WHY must use
+    resolve_with_llm_status instead. allow_fallback works as there:
+    the default model falls back to FREE_MODEL_FALLBACKS on a delisted
+    404, an explicit model never does.
+    """
+    ans, _status = resolve_with_llm_status(prompt, api_key=api_key,
+                                           model=model, cache=cache,
+                                           allow_fallback=allow_fallback)
+    return ans
 
 
 def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
                          symbol_table: set[str], cache=None,
                          model: str = DEFAULT_MODEL,
-                         allow_llm: bool = True) -> dict | None:
+                         allow_llm: bool = True,
+                         allow_fallback: bool = True) -> dict | None:
     """One uncertain dynamic call site, deterministic first, LLM second.
 
     Returns {"verdict", "confidence", "reason"} or None to stay uncertain.
@@ -347,7 +558,8 @@ def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
                         {n for n in re.findall(r"\b([a-zA-Z_][a-zA-Z0-9_]*)\b", source)})
     prompt = build_prompt(snippet, candidates, extract_string_literals(source),
                           vulnerable, "<dynamic-call-site>", call_line)
-    ans = resolve_with_llm(prompt, model=model, cache=cache)
+    ans = resolve_with_llm(prompt, model=model, cache=cache,
+                           allow_fallback=allow_fallback)
     if ans is None:
         return None
     ok, failures = verify_answer(ans, symbol_table, source, "uncertain", vulnerable=vulnerable)

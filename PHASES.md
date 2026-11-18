@@ -630,7 +630,40 @@ pyreach first writes a deterministic explanation (works with no key),
 then optionally asks the LLM once, in a closed world, to explain the
 same evidence in plain language. The LLM output NEVER changes a verdict.
 **Files:** `pyreach/explainer.py`, CLI `--explain` / `explain` in `pyreach/cli.py`
-**Status: built and tested, 19 Nov 2026. 85 tests (was 65), verify.py offline 31/31.**
+**Status: built and tested, 19 Nov 2026. 120 tests (was 65), verify.py offline 36/36.**
+**LLM status diagnosis (19 Nov 2026):** the first real MkDocs run with a
+key exposed that a failed LLM call was indistinguishable from "not
+tried" (`llm_explanation: null`, `llm_rejected: false`, `llm_enabled:
+true`). Fixed: `resolver.resolve_with_llm_status()` reports the kind
+(ok / no_key / no_requests / timeout / http_error / rate_limited /
+bad_json / network_error) with a safe detail (key redacted, ~120 chars);
+`explain_result` records `llm_status` / `llm_error` on every
+explanation ("rejected" on verifier failure, "not_called" with
+`--no-llm`); scans print `LLM explainer: N called, ... unavailable
+(<kind>)`; `pyreach llm-test` diagnoses the layer with one call, no
+scan (exit 0 ok, 1 otherwise). `resolve_with_llm` is unchanged for
+existing callers. See README "LLM not working?" and TESTS.md.
+**Free-model delisting + fallback chain (19 Nov 2026):** the day the
+diagnosis landed, a real `pyreach llm-test` on the user's machine got
+HTTP 404 "This model is unavailable for free. The paid version is
+available now - use this slug instead: openai/gpt-oss-20b" — the old
+default `openai/gpt-oss-20b:free` had been delisted, and the live
+OpenRouter catalog (GET /api/v1/models) listed no gpt-oss `:free`
+slug at all. Default is now `cohere/north-mini-code:free` (code-focused,
+answered all 3 passes in a 3 Nov 2026 free-model probe, in the live
+0/0-pricing catalog on 19 Nov 2026). `FREE_MODEL_FALLBACKS` in
+`pyreach/resolver.py` is [cohere/north-mini-code:free,
+google/gemma-4-31b-it:free, nvidia/nemotron-3.5-lightning:free]: on a
+404 whose body says "unavailable for free", the call tries the next
+model — no other failure switches models, and an explicit `--model`
+never falls back. The status dict and every explanation record
+`llm_model` (the model that answered, or the last tried); the cache
+key includes the model, so a fallback hit never poisons the default's
+entry, and the cache is checked across the whole chain before any
+network call. Free slugs churn every few weeks — re-check the default
+against the live catalog. Verified by mocked tests only in this VM
+(no live key here); the user must run `pyreach llm-test` and report
+the model it prints.
 
 Design source: research report §5 (Codex / Claude Code / Aider / Semgrep
 pattern: deterministic scanner -> LLM explainer with a narrow evidence

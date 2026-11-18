@@ -34,7 +34,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from .resolver import DEFAULT_MODEL, resolve_with_llm
+from .resolver import DEFAULT_MODEL, resolve_with_llm_status
 
 FOOTER = ("This explanation is limited to the evidence above. "
           "It does not prove the vulnerable function is (or is not) called. "
@@ -534,6 +534,16 @@ def deterministic_explanation(result, graph, root: Path, entries: set[str],
         "llm_explanation": None,
         "llm_rejected": False,
         "llm_failures": [],
+        # Status of the LLM layer for this explanation, recorded on
+        # EVERY explanation (see explain_result): "not_called" when the
+        # layer never ran (--no-llm), a resolver kind (no_key, timeout,
+        # rate_limited, ...) when the call returned nothing, "rejected"
+        # when an answer failed the verifier, "ok" when one was accepted.
+        "llm_status": "not_called",
+        "llm_error": None,
+        # Which model produced (or was last tried for) the LLM layer.
+        # The fallback chain means this is not always the default.
+        "llm_model": None,
         "discriminating_check": check,
         "does_not_know": unknown,
         "evidence_pack_tokens": pack["tokens_estimate"],
@@ -685,7 +695,8 @@ def verify_explainer_answer(answer, pack: dict, root: Path) -> tuple[bool, list[
 
 def explain_result(result, graph, root, advisory: dict,
                    entries: set[str], use_llm: bool = False,
-                   model: str = DEFAULT_MODEL, cache=None) -> dict:
+                   model: str = DEFAULT_MODEL, cache=None,
+                   allow_fallback: bool = True) -> dict:
     """Explain one uncertain result. Returns the report-shaped dict.
 
     Deterministic explanation always present. The LLM layer runs only
@@ -702,18 +713,35 @@ def explain_result(result, graph, root, advisory: dict,
         return exp
     prompt = build_explainer_prompt(pack)
     try:
-        ans = resolve_with_llm(prompt, model=model, cache=cache)
-    except Exception:
-        ans = None
+        ans, status = resolve_with_llm_status(prompt, model=model, cache=cache,
+                                              allow_fallback=allow_fallback)
+    except Exception as e:
+        # resolve_with_llm_status is written not to raise, but if it
+        # ever does, record that instead of swallowing it silently —
+        # a bare null with no reason is the bug this status exists to fix.
+        ans, status = None, {"kind": "network_error",
+                             "detail": f"unexpected error calling the LLM: {type(e).__name__}",
+                             "model": model}
     if ans is None:
-        # No key, no network, timeout: the LLM layer is unavailable.
-        # The deterministic explanation stands unchanged.
+        # No key, no network, timeout, rate limit, bad JSON: the LLM
+        # layer is unavailable. Record WHY — llm_enabled only proves a
+        # key was present, never that a call succeeded — and keep the
+        # deterministic explanation unchanged. Not a rejection.
+        exp["llm_status"] = status.get("kind", "network_error")
+        exp["llm_error"] = status.get("detail") or None
+        exp["llm_model"] = status.get("model")
         return exp
     ok, failures, cleaned = verify_explainer_answer(ans, pack, root)
     if not ok:
         exp["llm_rejected"] = True
         exp["llm_failures"] = failures
+        exp["llm_status"] = "rejected"
+        exp["llm_error"] = "; ".join(failures)[:200] or None
+        exp["llm_model"] = status.get("model")
         return exp
+    exp["llm_status"] = "ok"
+    exp["llm_error"] = None
+    exp["llm_model"] = status.get("model")
     assert cleaned is not None
     lines = [f"[llm-explainer] {cleaned['what_blocks']}"]
     for item in cleaned["evidence"]:
@@ -737,7 +765,13 @@ def format_explanation(exp: dict) -> str:
     if exp.get("llm_explanation"):
         parts.append(exp["llm_explanation"])
     elif exp.get("llm_rejected"):
-        parts.append("[llm-explainer unavailable — deterministic result unchanged]")
+        parts.append("[llm-explainer unavailable (rejected) — deterministic result unchanged]")
     else:
-        parts.append("[llm-explainer unavailable — deterministic result unchanged]")
+        status = exp.get("llm_status")
+        if status and status != "not_called":
+            detail = exp.get("llm_error")
+            suffix = f": {detail}" if detail else ""
+            parts.append(f"[llm-explainer unavailable ({status}{suffix}) — deterministic result unchanged]")
+        else:
+            parts.append("[llm-explainer unavailable — deterministic result unchanged]")
     return "\n".join(parts)

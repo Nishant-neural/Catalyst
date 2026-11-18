@@ -1,7 +1,7 @@
 """Explainer tests: deterministic first, LLM only as a verified explainer.
 
 No network, no key, no LLM call in any test — the LLM layer is tested
-by monkeypatching pyreach.explainer.resolve_with_llm.
+by monkeypatching pyreach.explainer.resolve_with_llm_status.
 """
 import json
 import tempfile
@@ -239,49 +239,68 @@ class TestLlmLayer(unittest.TestCase):
         return expl.explain_result(result, graph, root, ADV_DICT, entries, **kw), result
 
     def test_llm_unavailable_falls_back_to_deterministic_only(self):
-        real = expl.resolve_with_llm
-        expl.resolve_with_llm = lambda *a, **k: None
+        real = expl.resolve_with_llm_status
+        expl.resolve_with_llm_status = lambda *a, **k: (
+            None, {"kind": "timeout", "detail": "request timed out after 60s"})
         try:
             exp, result = self._explain(use_llm=True)
         finally:
-            expl.resolve_with_llm = real
+            expl.resolve_with_llm_status = real
         self.assertIsNone(exp["llm_explanation"])
         self.assertFalse(exp["llm_rejected"])  # unavailable, not rejected
+        # The reason is recorded, not swallowed: this is the diagnostic
+        # the MkDocs run was missing (null + not rejected, no reason).
+        self.assertEqual(exp["llm_status"], "timeout")
+        self.assertEqual(exp["llm_error"], "request timed out after 60s")
         self.assertIn(expl.FOOTER, exp["deterministic_explanation"])
-        self.assertIn("[llm-explainer unavailable — deterministic result unchanged]",
+        self.assertIn("[llm-explainer unavailable (timeout: request timed out after 60s)"
+                      " — deterministic result unchanged]",
                       expl.format_explanation(exp))
         self.assertEqual(result.verdict, "uncertain")  # verdict untouched
 
     def test_llm_rejected_answer_falls_back_to_deterministic_only(self):
-        real = expl.resolve_with_llm
+        real = expl.resolve_with_llm_status
         bad = {"blocker": "dynamic_call", "what_blocks": "It is safe.",
                "evidence": [], "what_would_resolve": [],
                "does_not_know": ["nothing"], "verdict": "not_reachable"}
-        expl.resolve_with_llm = lambda *a, **k: bad
+        expl.resolve_with_llm_status = lambda *a, **k: (
+            bad, {"kind": "ok", "detail": ""})
         try:
             exp, _ = self._explain(use_llm=True)
         finally:
-            expl.resolve_with_llm = real
+            expl.resolve_with_llm_status = real
         self.assertTrue(exp["llm_rejected"])
         self.assertTrue(exp["llm_failures"])
+        self.assertEqual(exp["llm_status"], "rejected")
         self.assertIsNone(exp["llm_explanation"])
-        self.assertIn("[llm-explainer unavailable — deterministic result unchanged]",
+        self.assertIn("[llm-explainer unavailable (rejected) — deterministic result unchanged]",
                       expl.format_explanation(exp))
 
     def test_llm_accepted_answer_is_labelled_and_kept(self):
-        real = expl.resolve_with_llm
+        real = expl.resolve_with_llm_status
         result, graph, root, entries = _uncertain_yaml_load("app_getattr_config")
         _, pack = expl.deterministic_explanation(result, graph, root, entries, ADV_DICT)
-        expl.resolve_with_llm = lambda *a, **k: _good_answer(pack)
+        expl.resolve_with_llm_status = lambda *a, **k: (
+            _good_answer(pack), {"kind": "ok", "detail": ""})
         try:
             exp = expl.explain_result(result, graph, root, ADV_DICT, entries,
                                       use_llm=True)
         finally:
-            expl.resolve_with_llm = real
+            expl.resolve_with_llm_status = real
         self.assertFalse(exp["llm_rejected"])
+        self.assertEqual(exp["llm_status"], "ok")
+        self.assertIsNone(exp["llm_error"])
         self.assertIsNotNone(exp["llm_explanation"])
         self.assertIn("[llm-explainer]", exp["llm_explanation"])
         self.assertNotIn("not_reachable", exp["llm_explanation"])
+
+    def test_llm_not_called_without_use_llm(self):
+        exp, _ = self._explain(use_llm=False)
+        self.assertEqual(exp["llm_status"], "not_called")
+        self.assertIsNone(exp["llm_error"])
+        self.assertIsNone(exp["llm_explanation"])
+        self.assertIn("[llm-explainer unavailable — deterministic result unchanged]",
+                      expl.format_explanation(exp))
 
 
 if __name__ == "__main__":

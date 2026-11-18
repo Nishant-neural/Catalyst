@@ -55,9 +55,61 @@ python -m pytest tests/ -q
    explanation is shown. Lines are labelled `[deterministic]` vs
    `[llm-explainer]`; no key means deterministic only.
 
+## Reading a scan — terminal is a summary, the HTML report is the interface
+
+A scan prints a short summary only: counts, one line per result, one
+line per uncertain explanation (`explain [uncertain] yaml.load —
+blocker dynamic_call, blocked at app.py:10`). The full entry-point
+list, entry evidence, and explanation text are NOT printed — on MkDocs
+that was ~240KB of terminal output (19 Nov 2026). Full detail is in
+`report.json`, and every scan also writes a readable `report.html`
+next to it — open it in a browser. It has the summary cards, the
+results table with call paths, the explanations with blockers and
+discriminating checks, and the proofs. `--verbose` restores the full
+terminal dump for debugging, `--no-html` skips the HTML file, and
+`pyreach report --report report.json` regenerates the HTML from an
+existing report without re-scanning.
+
 See `PHASES.md` for implementation details for Phases 1-5 and the
 explainer, the design question answers, the 24-hour timeline, and the
 demo script.
+
+## LLM not working? Run `pyreach llm-test` first
+
+Do not re-run a whole MkDocs scan to find out the LLM layer is dead —
+one scan tells you nothing about why, because a failed call used to
+look exactly like "not tried" (null explanation, not rejected). Run:
+
+```bash
+pyreach llm-test
+```
+
+One minimal call, no scan. It prints key presence only (never the
+value), then `ok in 1.23s` or the failure kind. Every explanation in
+`report.json` also carries `llm_status` / `llm_error`, and every scan
+with `--explain` prints one summary line, e.g.
+`LLM explainer: 3 called, 0 accepted, 0 rejected, 3 unavailable (timeout)`.
+`--llm-debug` adds the per-result status and safe detail.
+
+| `llm_status` | Means | What to do |
+|---|---|---|
+| `ok` | A parsed JSON answer came back (it may still be verifier-`rejected`) | Nothing — check `llm_rejected` next |
+| `rejected` | An answer came back but failed the citation verifier | Safe outcome, not a failure — read `llm_error` for the failed rule |
+| `no_key` | No `OPENROUTER_API_KEY` / `GROQ_API_KEY` in env or `.env` | Check the `.env` location: project root, or `--env-file <path>` |
+| `no_requests` | The `requests` package is not installed | `pip install requests` |
+| `timeout` | No reply in 60 s | Check the network, retry once |
+| `rate_limited` | HTTP 429, free-tier limit reached | Wait, then retry; fewer calls per run |
+| `http_error` | Another HTTP status (detail has the code) | Check the code in `llm_error` |
+| `http_error` + HTTP 404 "unavailable for free" | The free slug was delisted (happened to `openai/gpt-oss-20b:free` on 19 Nov 2026) | Run `llm-test` — it falls back automatically to the next free model and prints which one answered. If all fallbacks 404, re-check the live catalog at openrouter.ai/models. Never switch to the paid slug `openai/gpt-oss-20b` — that would bill you. An explicit `--model` never falls back. |
+| `bad_json` | The model replied, but not with the expected JSON | Retry — a free-tier model sometimes answers in prose |
+| `network_error` | Could not reach the endpoint at all | Check network / `LLM_BASE_URL` |
+| `not_called` | The LLM layer never ran (`--no-llm`) | Expected — deterministic explanations only |
+
+Note: `llm_enabled: true` in `report.json` only means a key was
+found. It never proves a call succeeded — `llm_status` is the proof.
+Each explanation also records `llm_model`: the model that actually
+answered it, which is not always the default when the fallback chain
+switched models on a delisted 404.
 
 ## Build priority — revised after ChatGPT review, 18 Nov 2026
 
@@ -100,6 +152,8 @@ unknown — do not accuse anyone, just do not follow it.
 - `pyreach/proof.py`, `pyreach/debate.py` — Phase 5
 - `pyreach/explainer.py` — explainer for uncertain results
   (deterministic first, one verified LLM call, never a verdict)
+- `pyreach/html_report.py` — readable HTML report written next to
+  report.json on every scan (stdlib only, all scanned content escaped)
 - `fixtures/` — app_vuln (reachable), app_safe (not-reachable),
   app_dead (dead code), app_getattr (uncertain)
 - `examples/advisory-sample.json` — OSV-style sample for yaml.load

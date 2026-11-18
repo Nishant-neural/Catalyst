@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 85 unit tests + 26 fixture scans + prompt + witness + explain
+python verify.py            # offline: 93 unit tests + 26 fixture scans + prompt + witness + explain + quiet/HTML
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,15 +39,22 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 85 tests run with stdlib unittest:
+# if pytest is not installed, the same 120 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 
-Expect: **85 passed**. These cover the call graph, the verifier's 10 rules,
+Expect: **120 passed**. These cover the call graph, the verifier's 10 rules,
 constant propagation, the witness, the debate rule, and the explainer
-(20 tests: citation verifier, evidence-pack caps, all four blocker
-templates, LLM unavailable / rejected / accepted). (`verify.py` tries
-pytest first and falls back to unittest on its own.)
+(21 tests: citation verifier, evidence-pack caps, all four blocker
+templates, LLM unavailable / rejected / accepted / not-called), plus 8 tests for
+the quiet terminal and HTML report (short stdout, --verbose restore,
+HTML written/escaped, `report` command), plus 26 tests for the LLM
+status diagnosis and free-model fallback (no_key / timeout / 429 /
+bad JSON / network error / cache hit / key redaction, the explainer
+summary line, `llm-test`, delisted-404 fallback to the next free
+model, all-fallbacks-404, 429 / other-404 / explicit --model never
+falling back, fallback cache isolation, CLI --model choice).
+(`verify.py` tries pytest first and falls back to unittest on its own.)
 
 ### 2. Fixture scans — expected verdicts (sample advisory, no network)
 
@@ -156,6 +163,17 @@ site), not line 15 (the safe literal `"safe_load"` — already decided).
 On app_vuln `--explain` prints "no uncertain results to explain"
 and the report's `explanations` list is empty.
 
+The terminal shows one line per explanation only
+(`explain [uncertain] yaml.load — blocker dynamic_call, blocked at
+app.py:10`) — the full text is in `report.json` and in the readable
+HTML report written next to it (`report.html`, same directory; open
+it in a browser). `report.json` records `"html_report": "report.html"`.
+`--verbose` restores the full explanation text on the terminal, and
+`pyreach report --report /tmp/report.json` regenerates the HTML from
+an existing report without re-scanning. A quiet scan has no terminal
+line over ~500 characters — a MkDocs scan used to print ~240KB, mostly
+one 151,785-character line of entry evidence (19 Nov 2026).
+
 With a key in `.env`, a plain `--explain` scan also runs the LLM
 layer (same auto-enable as Phase 4; `--no-llm` turns it off). The
 LLM answer is accepted only if its verdict is exactly `"uncertain"`,
@@ -256,9 +274,16 @@ To enable it, get a free key from OpenRouter:
 1. Go to [openrouter.ai/keys](https://openrouter.ai/keys) and sign up
    (GitHub or Google, no credit card). Create a key, copy it — it starts
    with `sk-or-v1-` and is shown once.
-2. Use the free model id `openai/gpt-oss-20b:free` (the `:free` suffix
-   matters: without it, it is the paid variant). Free tier is
+2. Use the free model id `cohere/north-mini-code:free` (the `:free`
+   suffix matters: without it, it is the paid variant). Free tier is
    rate-limited, roughly tens to a couple hundred requests a day.
+   (19 Nov 2026: the old default `openai/gpt-oss-20b:free` was
+   delisted by OpenRouter — `llm-test` got HTTP 404 "This model is
+   unavailable for free" — so the default changed. Do NOT use the paid
+   slug `openai/gpt-oss-20b` instead: that would bill you. Free slugs
+   churn every few weeks; if `llm-test` 404s, re-check the live
+   catalog at openrouter.ai/models, and note pyreach now falls back
+   automatically — see "LLM not working?" below.)
 3. Put the key in a `.env` file in the project root — this is the
    easiest way, and pyreach loads it automatically on every `scan`
    and `fetch` (no extra flag, no new dependency, stdlib parser in
@@ -294,7 +319,7 @@ To enable it, get a free key from OpenRouter:
    ```bash
    python -m pyreach.cli scan fixtures/app_getattr_config \
      --advisory examples/advisory-sample.json \
-     --model openai/gpt-oss-20b:free
+     --model cohere/north-mini-code:free
    ```
    Expect `app_getattr_config` to **stay uncertain** — its name comes
    from config, and the correct LLM answer there is "unknown". If it
@@ -303,3 +328,45 @@ To enable it, get a free key from OpenRouter:
 Groq is the alternative: a free key from console.groq.com/keys, set
 `GROQ_API_KEY`, and pass `--model llama-3.1-8b-instant` with
 `LLM_BASE_URL=https://api.groq.com/openai/v1/chat/completions`.
+
+### LLM not working? Diagnose it before re-scanning
+
+On the first real MkDocs run with a key (19 Nov 2026), all 3
+explanations had `llm_explanation: null` and `llm_rejected: false`
+with `llm_enabled: true`. That combination meant the LLM call itself
+had returned nothing — not rejected, just unavailable — and the code
+swallowed the reason, so there was zero evidence any call had ever
+succeeded. That gap is now closed: every explanation carries
+`llm_status` / `llm_error`, and `pyreach llm-test` diagnoses the
+layer with one call and no scan:
+
+```bash
+pyreach llm-test
+# ok:    LLM key: present / LLM test: ok in 1.23s (model cohere/north-mini-code:free)  (exit 0)
+# no key: LLM key: missing ... / LLM test: no_key — no OPENROUTER_API_KEY ...   (exit 1)
+```
+
+`llm_enabled: true` only means a key was found — it never proves a
+call succeeded. `llm_status` is the proof. Kinds and what to do:
+
+| `llm_status` | Means | What to do |
+|---|---|---|
+| `ok` | A parsed JSON answer came back | Nothing; check `llm_rejected` next |
+| `rejected` | Answer failed the citation verifier | Safe outcome — read `llm_error` for the rule |
+| `no_key` | No key in env or `.env` | Check the `.env` location (project root, scanned project, or `--env-file`) |
+| `no_requests` | `requests` not installed | `pip install requests` |
+| `timeout` | No reply in 60 s | Check network, retry once |
+| `rate_limited` | HTTP 429, free-tier limit | Wait, retry; fewer calls per run |
+| `http_error` | Another HTTP status | Read the code in `llm_error` |
+| `http_error` + HTTP 404 "unavailable for free" | The free slug was delisted (happened to `openai/gpt-oss-20b:free` on 19 Nov 2026) | Run `llm-test` — it now falls back automatically to the next free model (`google/gemma-4-31b-it:free`, then `nvidia/nemotron-3.5-lightning:free`) and prints which model answered. If all fallbacks 404, re-check the live catalog at openrouter.ai/models and update `FREE_MODEL_FALLBACKS` in `pyreach/resolver.py`. An explicit `--model` never falls back: that choice is yours, delisted or not. |
+| `bad_json` | Model replied, but not the expected JSON | Retry — free-tier models sometimes answer in prose |
+| `network_error` | Endpoint unreachable | Check network / `LLM_BASE_URL` |
+| `not_called` | Layer never ran (`--no-llm`) | Expected — deterministic only |
+
+A scan with `--explain` prints one summary line after the
+explanations, e.g. `LLM explainer: 3 called, 0 accepted, 0 rejected,
+3 unavailable (timeout)`; `--llm-debug` adds the per-result status
+and safe detail. The detail never contains the key or a response
+body — at most the HTTP status plus ~120 chars of an error message,
+key redacted. `verify.py` section H checks the no-key case: exit 1,
+kind `no_key`, no key value printed.
