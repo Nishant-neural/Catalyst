@@ -18,6 +18,7 @@ import sys
 from pathlib import Path
 
 from .advisory import load_advisories
+from .phase1 import analyse_advisory_live, save_advisories
 from .callgraph import build_graph
 from .cache import Cache
 from .completeness import Ledger
@@ -30,10 +31,33 @@ from .vex import build_openvex, write_openvex
 
 
 def main(argv=None) -> int:
+    # Phase 1 fetch command: pyreach fetch <package> <version> [--out advisories.json]
+    # Lives before the scan parser, so `fetch` does not need a project path.
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "fetch":
+        fp = argparse.ArgumentParser(prog="pyreach fetch", description="Phase 1: OSV -> fix commit -> diff -> vulnerable functions")
+        fp.add_argument("package")
+        fp.add_argument("version")
+        fp.add_argument("--out", default="advisories.json")
+        fargs = fp.parse_args(argv[1:])
+        print(f"fetching OSV for {fargs.package} {fargs.version} ...")
+        results = analyse_advisory_live(fargs.package, fargs.version)
+        save_advisories(results, fargs.out)
+        print(f"advisories: {len(results)}  -> {fargs.out}")
+        for r in results:
+            fc = r.get("fix_commit") or {}
+            print(f"  {r['id']} fixed={r.get('fixed_version')} commit={fc.get('sha', '')[:12] if fc.get('sha') else fc.get('via', 'none')}")
+            for c in r.get("candidates", []):
+                print(f"    {c['confidence']:6} {c['qualified'] or '(no candidate)'}  {c['evidence'][:100]}")
+        return 0
+
     p = argparse.ArgumentParser(prog="pyreach", description="Which vuln alerts actually affect this Python project?")
     p.add_argument("command", choices=["scan"])
     p.add_argument("project", help="Path to the Python project to scan")
-    p.add_argument("--advisory", required=True, help="Advisory JSON (OSV-style, see examples/advisory-sample.json)")
+    p.add_argument("--advisory", help="Advisory JSON (OSV-style, see examples/advisory-sample.json). If omitted, use --package + --version to fetch live (Phase 1).")
+    p.add_argument("--package", help="Package to fetch advisories for (with --version), e.g. PyYAML")
+    p.add_argument("--version", help="Installed version to fetch advisories for, e.g. 5.3.1")
     p.add_argument("--out", default="report.json", help="JSON report output")
     p.add_argument("--vex", default="openvex.json", help="OpenVEX output (only for not_reachable)")
     p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (needs OPENROUTER_API_KEY)")
@@ -46,7 +70,19 @@ def main(argv=None) -> int:
         print(f"error: project not found: {root}", file=sys.stderr)
         return 1
 
-    advisories = load_advisories(args.advisory)
+    if args.advisory:
+        advisories = load_advisories(args.advisory)
+    elif args.package and args.version:
+        print(f"Phase 1: fetching advisories for {args.package} {args.version} ...")
+        live = analyse_advisory_live(args.package, args.version)
+        # Write the live result next to the report so it is reproducible
+        Path("_live_advisories.json").write_text(json.dumps(live, indent=2), encoding="utf-8")
+        advisories = load_advisories("_live_advisories.json")
+        print(f"Phase 1: {len(advisories)} advisories, "
+              f"{sum(len(a.vulnerable_functions) for a in advisories)} candidates")
+    else:
+        print("error: give --advisory <json> or --package <name> --version <ver>", file=sys.stderr)
+        return 1
     cache = Cache(args.cache_dir)
     graph = build_graph(root)
     entries, entry_note = find_entrypoints(root, graph)
@@ -162,16 +198,21 @@ def main(argv=None) -> int:
         "pr_comments": [format_pr_comment(r, entry_note) for r in results],
     }
     Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    # OpenVEX only if the ledger is complete for not_reachable (ChatGPT fix).
-    # Otherwise a not_reachable verdict after a resolved dynamic case would
-    # still be written, but an unresolved one must never produce VEX.
-    vex_results = results if ledger.is_complete_for_not_reachable() else [
-        r for r in results if r.verdict == "not_reachable" and r.confidence == "high"
-        and "dynamic" not in r.reason
-    ]
-    # Simpler and safer: if ledger is not complete, write no VEX statements.
-    if not ledger.is_complete_for_not_reachable():
-        vex_results = []
+    # OpenVEX, per result, not per run (Phase 1 fix).
+    # The old rule blocked ALL VEX if any result was uncertain — one
+    # uncertain library-internal candidate (e.g. construct_python_object_new,
+    # dependency not parsed) then blocked VEX for yaml.full_load, which IS
+    # provably not_reachable from project source alone. That was wrong.
+    # Correct gate, per result: the verdict itself is not_reachable with
+    # high/medium confidence, AND the graph is clean (no dynamic trigger,
+    # no ambiguous edge, project fully parsed), so no hidden path could
+    # exist for that target. Uncertain results never produce VEX.
+    graph_clean = (not graph.dynamic and not graph.ambiguous
+                   and ledger.project_files_discovered == ledger.project_files_parsed)
+    vex_results = [
+        r for r in results
+        if r.verdict == "not_reachable" and r.confidence in ("high", "medium")
+    ] if graph_clean else []
     vex = build_openvex(vex_results, root.name)
     write_openvex(args.vex, vex)
     print(f"\nwrote {args.out} and {args.vex}")
