@@ -64,12 +64,15 @@ def load_advisories(path: str) -> list[Advisory]:
                 ))
             else:
                 funcs.append(VulnerableFunction(str(fn), "", "medium", "advisory"))
+        fc = item.get("fix_commit", "")
+        if isinstance(fc, dict):
+            fc = fc.get("sha", "") or fc.get("via", "")
         out.append(Advisory(
             id=item.get("id", item.get("vulnerability_id", "UNKNOWN")),
             package=pkg,
             vulnerable_versions=str(item.get("vulnerable_versions", "")),
             fixed_version=str(item.get("fixed_version", "")),
-            fix_commit=item.get("fix_commit", ""),
+            fix_commit=fc,
             references=refs,
             summary=item.get("summary", item.get("description", "")),
             vulnerable_functions=funcs,
