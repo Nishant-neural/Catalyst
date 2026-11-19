@@ -12,16 +12,23 @@ from datetime import datetime, timezone
 from .reach import Result
 
 
-def build_openvex(results: list[Result], project: str, graph_clean: bool = True,
+def build_openvex(results: list[Result], project: str,
+                  graph_clean: bool | dict[str, bool] = True,
                   author: str = "pyreach") -> dict:
     """OpenVEX output, aggregated at the advisory level (ChatGPT Critical
     2, 19 Nov 2026): a not_affected statement is about a vulnerability +
     product, not about one candidate function. It is emitted for an
     advisory ONLY when EVERY candidate for that advisory is not_reachable
-    with high/medium confidence AND the graph is clean (ledger complete
-    for not_reachable). One statement per advisory, with a combined note.
-    If even one candidate is reachable or uncertain, no statement is
-    emitted for that advisory at all — emitting not_affected next to a
+    with high/medium confidence AND the graph is clean for that advisory.
+    graph_clean may be a single bool (the old whole-run ledger) or a
+    per-advisory dict (Phase 13): the per-advisory gate is the precise
+    one — fully parsed, no unresolved imports or entry points, no
+    dynamic site still unresolved after Phase 4, and no ambiguous edge
+    or unresolved-attr site matching that advisory's targets. A global
+    count (e.g. PyYAML's own 64 ambiguous edges inside the parsed
+    dependency) must not block a statement for a target none of them
+    can be. If even one candidate is reachable or uncertain, no statement
+    is emitted for that advisory at all — emitting not_affected next to a
     reachable finding in the same report contradicted the tool's own
     results. Uncertain results never produce VEX."""
     by_adv: dict[str, list[Result]] = {}
@@ -29,7 +36,9 @@ def build_openvex(results: list[Result], project: str, graph_clean: bool = True,
         by_adv.setdefault(r.advisory_id, []).append(r)
     statements = []
     for adv_id, rs in by_adv.items():
-        if not graph_clean:
+        clean = (graph_clean.get(adv_id, False)
+                 if isinstance(graph_clean, dict) else graph_clean)
+        if not clean:
             continue
         if not all(r.verdict == "not_reachable"
                    and r.confidence in ("high", "medium") for r in rs):

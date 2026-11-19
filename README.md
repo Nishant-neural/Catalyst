@@ -109,13 +109,13 @@ terminal dump for debugging, `--no-html` skips the HTML file, and
 `pyreach report --report report.json` regenerates the HTML from an
 existing report without re-scanning.
 
-See `PHASES.md` for implementation details for Phases 1–10 and the
+See `PHASES.md` for implementation details for Phases 1–13 and the
 explainer, the design question answers, the 24-hour timeline, and the
 demo script. See `EVALUATION.md` for the requirements verdict and the
-numbers: 35/35 fixtures, 7 real projects, 0 false reachable, 0 false
-not_reachable. See `demo/README.md` for the three-repo demo (Flask,
-requests, httpx scanned whole: 2 reachable, 18 uncertain with
-pre-seeded deterministic explanations, no LLM) and run it with
+numbers: 40/40 fixtures, 7 real projects, 0 false reachable, 0 false
+not_reachable. See `demo/README.md` for the four-repo demo (Flask, requests, httpx,
+yamllint scanned whole: 2 reachable, 12 uncertain, 13 not_reachable
+with pre-seeded deterministic explanations, no LLM) and run it with
 `bash demo/run-demo.sh`.
 
 ## LLM not working? Run `pyreach llm-test` first

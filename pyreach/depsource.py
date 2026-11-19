@@ -213,6 +213,8 @@ def merge_dependency(graph: Graph, dep: Graph, import_name: str,
         graph.ambiguous.setdefault(caller, set()).update(cands)
     graph.dynamic.extend(dep.dynamic)
     graph.unresolved_attrs.extend(dep.unresolved_attrs)
+    for (caller, callee), loaders in dep.loader_calls.items():
+        graph.loader_calls.setdefault((caller, callee), set()).update(loaders)
     # Deliberately NOT merged: referenced_dotted / referenced_names.
     # The reference rule (reach._referenced_in_project) is about
     # PROJECT code handing a target to something (Loader=yaml.FullLoader

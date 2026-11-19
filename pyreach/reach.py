@@ -176,6 +176,42 @@ def _is_library_internal(qualified: str, graph: Graph) -> bool:
     return qualified.split(".")[0] not in graph.imported_modules
 
 
+def dep_entry_call(graph: Graph, entrypoints: set[str],
+                   qualified: str) -> str | None:
+    """A reachable call into the candidate's own package, or None.
+
+    19 Nov 2026 (ChatGPT Phase 9 review, Issue 2, reproduced against
+    Phase 11): an app calling thirdparty.safe_api() got
+    thirdparty.vulnerable NOT_REACHABLE + an OpenVEX not_affected
+    statement while the dependency source was 0 parsed and the report
+    still claimed complete_for_not_reachable — the wrapper may call the
+    vulnerable function internally, and nothing had looked inside it.
+    If reachable project code calls any function of the candidate's
+    package (an external node, file == "external") and that package's
+    source was not parsed, the candidate cannot be proven
+    not_reachable: return the entry call's name. None when the
+    candidate is project code, its package source was parsed
+    (--with-deps), or no reachable call enters that package at all.
+    The candidate itself is excluded: a direct call to it is a real
+    path, handled by BFS before this is ever consulted.
+    """
+    if _is_project_function(graph, qualified):
+        return None
+    first = qualified.split(".")[0]
+    if first in graph.dependency_parsed_modules:
+        return None
+    if first not in graph.imported_modules:
+        return None
+    reached = reachable_functions(graph, entrypoints)
+    for node in sorted(reached):
+        if node.split(".")[0] != first or node == qualified:
+            continue
+        info = graph.functions.get(node)
+        if info is not None and info.file == "external":
+            return node
+    return None
+
+
 def _unresolved_attr_for(graph: Graph, target: str, starts: set[str]) -> list[dict]:
     """Unresolved attribute call sites whose attribute name is the
     target's simple name (ChatGPT Critical 1, 19 Nov 2026): parser.load()
@@ -220,6 +256,32 @@ def _target_in_graph(graph: Graph, target: str) -> bool:
                for t in graph.functions)
 
 
+def _is_dep_internal(qualified: str, graph: Graph) -> bool:
+    """True if the candidate is a function inside a parsed dependency
+    that the project never calls directly and that is not a public API
+    of that dependency (Phase 12, 19 Nov 2026).
+
+    With --with-deps the candidate IS in the graph as a merged dep
+    function, so _is_library_internal says False — it looks like
+    project code. But a constructor the loader dispatches to
+    internally (FullConstructor.construct_python_object) is still
+    library-internal: the project never calls it, and its first
+    segment is not a module the project imports. Public APIs of the
+    dep (yaml.full_load, bare full_load) are excluded, exactly as in
+    _is_library_internal — a public API the project does not call is
+    not proven reachable by the loader being reachable.
+    """
+    if "." not in qualified:
+        return False  # bare name: top-level package API
+    if qualified.split(".")[0] in graph.imported_modules:
+        return False  # public API of an imported module
+    return any(
+        (t == qualified or t.endswith("." + qualified))
+        and graph.functions[t].file in graph.dependency_files
+        for t in graph.functions
+    )
+
+
 def propagate_library_internals(results: list[Result], graph: Graph) -> list[Result]:
     """If a public loader (yaml.load / yaml.full_load) is reachable, then a
     library-internal constructor it uses internally is reachable too, even
@@ -238,13 +300,90 @@ def propagate_library_internals(results: list[Result], graph: Graph) -> list[Res
             continue
         api = apis[0]
         for r in rs:
-            if r.verdict == "uncertain" and _is_library_internal(r.vulnerable_function, graph):
+            if r.verdict == "uncertain" and (
+                    _is_library_internal(r.vulnerable_function, graph)
+                    or _is_dep_internal(r.vulnerable_function, graph)):
+                # With --with-deps the same rule still applies: the
+                # dep's own dispatch to its internals (a dict lookup in
+                # PyYAML's constructor, not a static call edge) is not
+                # traceable by BFS. Candidates BFS proved not_reachable
+                # are never touched — only uncertain ones.
+                parsed = _is_dep_internal(r.vulnerable_function, graph)
                 r.verdict = "reachable"
                 r.confidence = "medium"
                 r.path = list(api.path) + [r.vulnerable_function]
+                how = ("library internal; the loader's internal dispatch "
+                       "is not statically traceable, dependency source parsed"
+                       if parsed else
+                       "library internal, dependency source not parsed")
                 r.reason = (f"Reached inside the library via {api.vulnerable_function} "
-                            f"(library internal, dependency source not parsed): "
-                            f"{' -> '.join(r.path)}")
+                            f"({how}): {' -> '.join(r.path)}")
+    return results
+
+
+def apply_loader_rule(graph: Graph, results: list[Result],
+                      entrypoints: set[str]) -> list[Result]:
+    """Loader-aware verdicts for the yaml.load family (Phase 13,
+    19 Nov 2026 — the known Loader-argument blind spot since Phase 11).
+
+    yaml.load's danger is its Loader: load(stream) defaults to the
+    unsafe Loader, load(stream, SafeLoader) cannot construct arbitrary
+    Python objects, and safe_load() IS load() with SafeLoader. A
+    project that only ever reaches yaml.load through SafeLoader never
+    executes the vulnerable code — so a reachable verdict becomes
+    not_reachable, with the loader named in the reason.
+
+    Soundness: the flip needs the WHOLE loader picture, not just the
+    one BFS path — a project could call yaml.load safely in one place
+    and unsafely in another, and BFS returns only the shortest path.
+    So loaders are collected over every loader call into the target
+    from a reachable caller, and the flip happens only if every one
+    of them is safe. Any unsafe or unknown loader, or no recorded
+    loader step at all, leaves the verdict alone (fail-closed).
+    Only reachable results are flipped: uncertain ones are Phase 4's
+    job, and a result BFS proved not_reachable is never touched.
+    """
+    safe = {"SafeLoader", "CSafeLoader"}
+    # Which loader calls feed each candidate. full_load is load() with
+    # FullLoader by definition, so it can never flip; the constructors
+    # are fed by both load() and full_load().
+    feeds = {
+        "yaml.load": {"yaml.load", "load", "yaml.safe_load",
+                      "yaml.safe_load_all"},
+        "yaml.full_load": {"yaml.full_load", "full_load",
+                           "yaml.full_load_all"},
+        "full_load": {"yaml.full_load", "full_load",
+                      "yaml.full_load_all"},
+        "FullConstructor.construct_python_module": {
+            "yaml.load", "load", "yaml.safe_load", "yaml.safe_load_all",
+            "yaml.full_load", "full_load", "yaml.full_load_all"},
+        "FullConstructor.construct_python_object": {
+            "yaml.load", "load", "yaml.safe_load", "yaml.safe_load_all",
+            "yaml.full_load", "full_load", "yaml.full_load_all"},
+        "FullConstructor.construct_python_object_new": {
+            "yaml.load", "load", "yaml.safe_load", "yaml.safe_load_all",
+            "yaml.full_load", "full_load", "yaml.full_load_all"},
+    }
+    reached = reachable_functions(graph, entrypoints)
+    for r in results:
+        if r.verdict != "reachable" or r.vulnerable_function not in feeds:
+            continue
+        if not r.path or len(r.path) < 2:
+            continue
+        loaders: set[str] = set()
+        seen_step = False
+        for (caller, callee), ls in graph.loader_calls.items():
+            if caller in reached and callee in feeds[r.vulnerable_function]:
+                seen_step = True
+                loaders |= ls
+        if seen_step and loaders and loaders <= safe:
+            r.verdict = "not_reachable"
+            r.confidence = "medium"
+            r.path = []
+            r.reason = (f"Reached only through {sorted(loaders)} — "
+                        f"the unsafe Loader is never used, so the "
+                        f"vulnerable construction code is not in the "
+                        f"execute path (loader-aware, {r.vulnerable_function}).")
     return results
 
 
@@ -352,6 +491,22 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
                     reason=(f"No static path found, but {vf.qualified} is referenced "
                             f"in project code without being called (e.g. passed as an "
                             f"argument) and may be invoked through that reference."),
+                    function_confidence=vf.confidence,
+                ))
+                continue
+            # No path, but reachable code calls into the candidate's own
+            # package while that package's source was not parsed: the
+            # library may call the candidate internally (Issue 2 above).
+            dep_hit = dep_entry_call(graph, entrypoints, vf.qualified)
+            if dep_hit:
+                results.append(Result(
+                    advisory_id=adv.id, package=adv.package,
+                    vulnerable_function=vf.qualified, verdict="uncertain",
+                    confidence="low", path=[],
+                    reason=(f"No static path found, but reachable code calls "
+                            f"{dep_hit} and the {vf.qualified.split('.')[0]} "
+                            f"source is not parsed, so the library may call "
+                            f"{vf.qualified} internally."),
                     function_confidence=vf.confidence,
                 ))
                 continue

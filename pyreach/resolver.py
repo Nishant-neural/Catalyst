@@ -532,11 +532,90 @@ def resolve_with_llm(prompt: str, api_key: str | None = None,
     return ans
 
 
+_NOT_GETATTR = object()  # sentinel: the call at a line is not getattr()
+
+
+def getattr_receiver(source: str, call_line: int,
+                     imports: dict[str, str] | None = None):
+    """Module identity of the receiver of the getattr() call at call_line.
+
+    Returns the resolved module name (e.g. "yaml"), None when the
+    receiver cannot be determined (a variable, an attribute such as
+    self.option, a call), or _NOT_GETATTR when the call at that line is
+    not getattr() at all (eval, import_module, ...), for which this
+    gate does not apply.
+
+    19 Nov 2026 (ChatGPT Phase 9 review, Issue 3, reproduced against
+    Phase 11): the resolver matched only the attribute's simple name,
+    so getattr(json, "load") was reported REACHABLE for yaml.load with
+    high confidence — json.load is not yaml.load. The receiver's module
+    identity is part of the target; a known receiver from another
+    module cannot reach this target, and an unknown receiver must stay
+    uncertain, never be guessed by name alone.
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call) or node.lineno != call_line:
+            continue
+        func = node.func
+        is_getattr = ((isinstance(func, _ast.Name) and func.id == "getattr")
+                      or (isinstance(func, _ast.Attribute)
+                          and func.attr == "getattr"))
+        if not is_getattr:
+            continue
+        if not node.args:
+            return None
+        recv = node.args[0]
+        if isinstance(recv, _ast.Constant) and isinstance(recv.value, str):
+            return recv.value
+        if isinstance(recv, _ast.Name):
+            if imports is None:
+                return recv.id
+            # Only a name the file actually imports is a known module;
+            # a plain variable holding a module (mod = yaml) is unknown.
+            return imports.get(recv.id)
+        # Attribute / Subscript / Call receiver: object type unknown.
+        return None
+    return _NOT_GETATTR
+
+
+def _dynamic_call_kind(source: str, call_line: int) -> str | None:
+    """Callee name of the dynamic call at call_line, or None.
+
+    Used to tell apart dynamic sites that can invoke a function
+    (getattr, import_module, eval, exec) from ones that cannot
+    (setattr only sets an attribute; globals/locals/vars only return
+    a namespace dict). A setattr/globals site can never call the
+    vulnerable function, so it resolves safe immediately instead of
+    staying unresolved and blocking every not_reachable verdict.
+    """
+    import ast as _ast
+    try:
+        tree = _ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Call) or node.lineno != call_line:
+            continue
+        func = node.func
+        if isinstance(func, _ast.Name):
+            return func.id
+        if isinstance(func, _ast.Attribute):
+            return func.attr
+        return None
+    return None
+
+
 def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
                          symbol_table: set[str], cache=None,
                          model: str = DEFAULT_MODEL,
                          allow_llm: bool = True,
-                         allow_fallback: bool = True) -> dict | None:
+                         allow_fallback: bool = True,
+                         imports: dict[str, str] | None = None) -> dict | None:
     """One uncertain dynamic call site, deterministic first, LLM second.
 
     Returns {"verdict", "confidence", "reason"} or None to stay uncertain.
@@ -553,7 +632,32 @@ def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
     One site's answer decides ONE site, not the whole result. The caller
     (cli.py) must aggregate across all dynamic sites: a single safe site
     does not make the target not_reachable — see the 19 Nov 2026 fix.
+
+    Receiver gate (19 Nov 2026, ChatGPT Phase 9 review Issue 3): the
+    getattr receiver's module must be able to be the vulnerable
+    function — a known receiver from another module makes this site
+    safe, and an unknown receiver stays uncertain without any LLM
+    call. Bare vulnerable names (no module) skip the gate: there is no
+    module identity to check against.
+
+    Order (19 Nov 2026, Phase 13): constant propagation runs FIRST,
+    because the NAME is what decides whether the vulnerable function
+    can be called at all — getattr(rule, 'CONF') can never be
+    yaml.load, whatever rule is. The receiver only disambiguates
+    when the name IS vulnerable: getattr(json, 'load') is safe
+    because the receiver is json, while getattr(x, 'load') with x
+    unknown stays uncertain. The old gate-first order returned
+    None for every unknown receiver before constants ran, so three
+    literal-name sites in yamllint ('CONF', 'DEFAULT', 'name')
+    blocked every not_reachable verdict in the project.
     """
+    kind = _dynamic_call_kind(source, call_line)
+    if kind in ("setattr", "globals", "locals", "vars"):
+        return {"verdict": "not_reachable", "confidence": "high",
+                "reason": f"dynamic site is {kind}(), which cannot call "
+                          f"a function (line {call_line})"}
+    if kind in ("eval", "exec", "__import__"):
+        return None  # can invoke anything, name unknown
     vuln_simple = {v.split(".")[-1] for v in vulnerable}
     vals = constant_propagate_getattr(source, call_line)
     if vals is not None:
@@ -561,11 +665,35 @@ def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
             return {"verdict": "not_reachable", "confidence": "high",
                     "reason": "constant propagation: loop over an empty list, the dynamic call never runs"}
         if vals and any(v in vuln_simple for v in vals):
-            hit = next(v for v in vals if v in vuln_simple)
-            return {"verdict": "reachable", "confidence": "high",
-                    "reason": f"constant propagation: dynamic name can be {vals}, including vulnerable {hit} (line {call_line})"}
+            # The name could be the vulnerable function — only the
+            # receiver can clear it now.
+            receiver = getattr_receiver(source, call_line, imports)
+            if receiver is _NOT_GETATTR or receiver is None:
+                return None  # unknown receiver: could be the vulnerable module
+            dotted = [v for v in vulnerable if "." in v]
+            if dotted and any(v == receiver or v.startswith(receiver + ".")
+                              for v in dotted):
+                hit = next(v for v in vals if v in vuln_simple)
+                return {"verdict": "reachable", "confidence": "high",
+                        "reason": f"constant propagation: dynamic name can be {vals}, including vulnerable {hit} (line {call_line})"}
+            return {"verdict": "not_reachable", "confidence": "high",
+                    "reason": f"getattr receiver is module '{receiver}', "
+                              f"not the vulnerable module for "
+                              f"{vulnerable[0]} (line {call_line})"}
         return {"verdict": "not_reachable", "confidence": "high",
                 "reason": f"constant propagation: dynamic name can only be {vals}, none vulnerable (line {call_line})"}
+    receiver = getattr_receiver(source, call_line, imports)
+    if receiver is not _NOT_GETATTR:
+        dotted = [v for v in vulnerable if "." in v]
+        if dotted:
+            if receiver is None:
+                return None  # unknown receiver: cannot match any module
+            if not any(v == receiver or v.startswith(receiver + ".")
+                       for v in dotted):
+                return {"verdict": "not_reachable", "confidence": "high",
+                        "reason": f"getattr receiver is module '{receiver}', "
+                                  f"not the vulnerable module for "
+                                  f"{vulnerable[0]} (line {call_line})"}
     # LLM, only because the deterministic step could not decide, and
     # only if the caller allowed it.
     if not allow_llm:
@@ -589,7 +717,11 @@ def resolve_getattr_case(source: str, call_line: int, vulnerable: list[str],
     if ans["can_reach"] is True:
         return {"verdict": "reachable", "confidence": "medium",
                 "reason": f"LLM resolver (verified, lines {ans['evidence_lines']}): {ans['reason']}"}
-    if ans["can_reach"] is False:
-        return {"verdict": "not_reachable", "confidence": "medium",
-                "reason": f"LLM resolver (verified, lines {ans['evidence_lines']}): {ans['reason']}"}
-    return None  # "unknown": stay uncertain
+    # can_reach False from the LLM never certifies absence (19 Nov 2026,
+    # ChatGPT Phase 9 review Issue 4): the model can list
+    # ["safe_load"] while a config value can supply "load", and the
+    # verifier cannot prove the list is exhaustive. The LLM may propose
+    # a reachable target, but only deterministic constant propagation
+    # (above) may return not_reachable. A verified false answer is
+    # therefore treated exactly like "unknown": stay uncertain.
+    return None  # "unknown" or LLM-claimed false: stay uncertain

@@ -159,7 +159,9 @@ class TestVexAggregation(unittest.TestCase):
         self.assertEqual(by_fn["yaml.load"]["verdict"], "reachable")
         self.assertEqual(by_fn["FullLoader"]["verdict"], "uncertain")
         self.assertEqual(by_fn["full_load"]["verdict"], "not_reachable")
-        self.assertEqual(by_fn["yaml.full_load"]["verdict"], "not_reachable")
+        # Phase 12: yaml.full_load is uncertain without --with-deps —
+        # reachable code calls yaml.load and yaml source is unparsed.
+        self.assertEqual(by_fn["yaml.full_load"]["verdict"], "uncertain")
         self.assertEqual(vex["statements"], [])
         self.assertEqual(code, 2)
 
@@ -200,7 +202,10 @@ class TestLedgerGate(unittest.TestCase):
         self.assertEqual(code, 0)
 
     def test_clean_app_stays_not_reachable_and_gets_vex(self):
-        report, code, vex = run_scan("app_safe")
+        # Phase 12: app_safe is uncertain now (it calls yaml.safe_load
+        # with yaml source unparsed), so the all-clear case is app_dead,
+        # which calls no yaml function at all.
+        report, code, vex = run_scan("app_dead")
         r = report["results"][0]
         self.assertEqual(r["verdict"], "not_reachable")
         self.assertEqual(len(vex["statements"]), 1)
@@ -324,3 +329,39 @@ class TestDepsPhase8(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPerAdvisoryVexGate(unittest.TestCase):
+    # Phase 13, 19 Nov 2026: the VEX gate is per-advisory, not the
+    # whole-run ledger. A global ambiguous count (PyYAML's own 64
+    # ambiguous edges inside the parsed dependency) must not block a
+    # statement for targets none of them can be.
+    def _results(self, adv, verdicts):
+        from pyreach.reach import Result
+        return [Result(adv, "PyYAML", fn, v, "high")
+                for fn, v in verdicts]
+
+    def test_dict_clean_emits_only_for_the_clean_advisory(self):
+        from pyreach.vex import build_openvex
+        results = (self._results("GHSA-CLEAN", [
+                        ("yaml.load", "not_reachable"),
+                        ("yaml.full_load", "not_reachable")])
+                   + self._results("GHSA-DIRTY", [
+                        ("yaml.load", "not_reachable"),
+                        ("yaml.full_load", "uncertain")]))
+        vex = build_openvex(results, "proj",
+                            graph_clean={"GHSA-CLEAN": True,
+                                         "GHSA-DIRTY": False})
+        self.assertEqual(
+            [s["vulnerability"]["@id"] for s in vex["statements"]],
+            ["GHSA-CLEAN"])
+
+    def test_bool_clean_keeps_old_behaviour(self):
+        from pyreach.vex import build_openvex
+        results = self._results("GHSA-1", [("yaml.load", "not_reachable")])
+        self.assertEqual(
+            len(build_openvex(results, "proj", graph_clean=True)
+                ["statements"]), 1)
+        self.assertEqual(
+            len(build_openvex(results, "proj", graph_clean=False)
+                ["statements"]), 0)

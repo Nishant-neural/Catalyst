@@ -81,6 +81,13 @@ class Graph:
     file_imports: dict[str, set[str]] = field(default_factory=dict)
     imported_modules: set[str] = field(default_factory=set)
     unresolved_imports: list[str] = field(default_factory=list)
+    # Loader argument on calls into the yaml.load family (Phase 13,
+    # 19 Nov 2026): {(caller, callee): {loader, ...}} where loader is
+    # the simple class name (SafeLoader, Loader, FullLoader, ...) or
+    # "unknown" when the argument is not a literal class reference.
+    # safe_load / full_load are recorded as their loader (SafeLoader /
+    # FullLoader) even though they take no Loader argument.
+    loader_calls: dict[tuple[str, str], set[str]] = field(default_factory=dict)
     # Absolute file path -> module name, for deciding whether a dynamic /
     # unresolved site's code can execute (reach.site_can_run): a site in
     # a dunder method of a module imported by reachable code runs at
@@ -292,12 +299,77 @@ class _FileVisitor(ast.NodeVisitor):
                 "caller": caller, "callee_raw": callee,
                 "file": self.file, "line": node.lineno, "kind": kind,
             })
+            loader = _loader_for_call(self, node, callee)
+            if loader is not None:
+                self.graph.loader_calls.setdefault(
+                    (caller, callee), set()).add(loader)
             if kind == "dynamic":
                 self.graph.dynamic.append({
                     "file": self.file, "line": node.lineno,
                     "kind": callee, "caller": caller,
                 })
         self.generic_visit(node)
+
+
+# --- Loader tracking (Phase 13, 19 Nov 2026) -------------------------------
+# yaml.load's danger is its Loader argument: load(stream) defaults to
+# the unsafe Loader, load(stream, SafeLoader) cannot construct arbitrary
+# Python objects. safe_load() is load() with SafeLoader, full_load()
+# is load() with FullLoader. Recording the Loader at each call site
+# lets reach.apply_loader_rule tell a safe_load-only project from one
+# that really uses the unsafe Loader.
+_YAML_LOADER_DEFAULTS = {
+    "yaml.load": "Loader", "yaml.load_all": "Loader",
+    "yaml.full_load": "FullLoader", "yaml.full_load_all": "FullLoader",
+    "yaml.safe_load": "SafeLoader", "yaml.safe_load_all": "SafeLoader",
+    "yaml.unsafe_load": "Loader",
+    "load": "Loader", "load_all": "Loader",
+    "full_load": "FullLoader", "full_load_all": "FullLoader",
+}
+_YAML_LOADER_SUGAR = {
+    "yaml.safe_load": "SafeLoader", "yaml.safe_load_all": "SafeLoader",
+    "yaml.unsafe_load": "Loader",
+}
+
+
+def _loader_arg_value(visitor, value):
+    """Simple class name of a Loader argument, or 'unknown'."""
+    if isinstance(value, ast.Name):
+        return visitor.imports.get(value.id, value.id).split(".")[-1]
+    if isinstance(value, ast.Attribute):
+        dotted = visitor._dotted(value)
+        return dotted.split(".")[-1] if dotted else "unknown"
+    return "unknown"
+
+
+def _loader_for_call(visitor, node, callee):
+    """Loader used by this call into the yaml.load family, or None.
+
+    Only yaml loader calls are recorded. Bare load/full_load are
+    recorded only for code inside the yaml package itself (PyYAML's
+    own safe_load calls load(stream, SafeLoader)); a bare load()
+    elsewhere could be any library's.
+    """
+    simple = callee.split(".")[-1]
+    if callee in _YAML_LOADER_SUGAR:
+        return _YAML_LOADER_SUGAR[callee]
+    if callee in _YAML_LOADER_DEFAULTS:
+        if callee.startswith("yaml."):
+            pass
+        elif visitor.module not in ("yaml",) and not visitor.module.startswith("yaml."):
+            return None
+    elif simple in ("load", "full_load", "load_all", "full_load_all"):
+        if visitor.module not in ("yaml",) and not visitor.module.startswith("yaml."):
+            return None
+        callee = simple
+    else:
+        return None
+    for kw in node.keywords:
+        if kw.arg == "Loader":
+            return _loader_arg_value(visitor, kw.value)
+    if len(node.args) >= 2:
+        return _loader_arg_value(visitor, node.args[1])
+    return _YAML_LOADER_DEFAULTS[callee]
 
 
 def _module_name(path: Path, root: Path) -> str:

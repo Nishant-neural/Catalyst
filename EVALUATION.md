@@ -138,3 +138,29 @@ and 0 unresolved imports** in its ledger.
 - The both-sides fix-commit mapping is exercised via mocked tests +
   the PyYAML advisory only; "test >=3 materially different
   advisories" is still open.
+
+## Phase 12 update (19 Nov 2026)
+
+This document is the Phase 9 evaluation; the numbers above are as
+measured then. Phase 12 (see PHASES.md) changed one of them: the
+fixture `app_safe` is now **uncertain**, not not_reachable, without
+`--with-deps` — it calls `yaml.safe_load()` while the yaml source is
+unparsed, and the new dependency-entry rule says the library may call
+`yaml.load` internally. The 7-project real-world table is unaffected
+(all 7 were already 7/7 uncertain except MkDocs' 4 reachable), and
+the demo totals are unchanged (Flask 0/9, requests 1/2, httpx 1/7).
+The "never marks a reachable vulnerability as not_reachable" claim in
+this document now holds against ChatGPT's relative-import,
+dependency-wrapper, getattr-receiver and nested-entry repros as well
+— see `tests/test_phase12.py`.
+
+## Phase 13 update (19 Nov 2026)
+
+- Loader-aware verdicts + resolver reorder + per-advisory VEX gate
+  (see PHASES.md Phase 13). The "no real project reaches not_reachable"
+  weakness is now fixed for one project: **yamllint 7/7 not_reachable +
+  1 OpenVEX statement** (`--with-deps`). bandit and cookiecutter stay
+  7/7 uncertain (completeness gate + unresolvable plugin dynamic sites),
+  MkDocs stays 4/3. The 7-project table above is unchanged in the
+  no-deps mode; the loader limit it documents ("Loader arguments not
+  distinguished") is now closed for the yaml.load family.

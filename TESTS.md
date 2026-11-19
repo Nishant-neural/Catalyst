@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 202 unit tests + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+python verify.py            # offline: 233 unit tests + 40 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -67,7 +67,7 @@ Exit code is part of the contract: **2 = reachable, 0 = not_reachable / uncertai
 | Fixture | Expected | What it proves |
 |---|---|---|
 | app_vuln | reachable, exit 2 | basic path main → load_config → yaml.load |
-| app_safe | not_reachable, exit 0 | only safe_load is used |
+| app_safe | uncertain, exit 0 | safe_load enters yaml, dep source unparsed (Phase 12) |
 | app_dead | not_reachable, exit 0 | dead() calls yaml.load but is never called |
 | app_getattr | not_reachable, exit 0 | `name = "safe_load"` resolved by constants |
 | app_wrapper | reachable, exit 2 | call through helpers.parse_config |
@@ -98,6 +98,9 @@ Exit code is part of the contract: **2 = reachable, 0 = not_reachable / uncertai
 | app_unparsed | **uncertain**, exit 0 | 1/2 files parsed — completeness gate flips not_reachable (Phase 8) |
 | app_mockpatch | not_reachable, exit 0 | `@mock.patch` is not a route, no phantom entry (Phase 8) |
 | app_dunder | **uncertain**, exit 0 | getattr inside `__getattr__` runs at runtime though nothing calls it by name (Phase 8) |
+| app_getattr_json | not_reachable, exit 0 | `getattr(json, "load")` is json.load, not yaml.load — receiver identity (Phase 12) |
+| app_nested_cli | not_reachable, exit 0 | unimported nested `pkg/cli.py` is not a program root (Phase 12) |
+| app_dep_wrapper | **uncertain**, exit 0 | app calls `thirdparty.safe_api()`, dep source unparsed — unit-test-only, thirdparty advisory (Phase 12) |
 
 ### 3. Phase 4 — the resolver, no key needed
 
@@ -360,8 +363,10 @@ To enable it, get a free key from OpenRouter:
    pyreach prints `.env: loaded 1 key(s) from .../.env
    (OPENROUTER_API_KEY)` — the key value itself is never printed,
    logged, or written into report.json / openvex.json.
-   A `.env` in the scanned project's folder also works, and
-   `--env-file <path>` points at a `.env` somewhere else.
+   A `.env` in the scanned project's folder is deliberately NOT read
+   (Phase 12): a scanned repo is untrusted, and its `.env` could
+   redirect LLM requests carrying your key. `--env-file <path>`
+   points at a `.env` somewhere else.
    A real environment variable always wins over `.env`: if
    `OPENROUTER_API_KEY` is already set, the `.env` value is ignored
    for that key (pyreach says so on the `.env:` line).

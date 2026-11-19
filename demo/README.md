@@ -1,4 +1,4 @@
-# pyreach demo — three real repos, scanned whole
+# pyreach demo — four real repos, scanned whole
 
 Run it: `bash demo/run-demo.sh [workdir]` (defaults to `./demo-work`).
 It clones Flask, requests and httpx, scans each repo's **whole runtime
@@ -11,8 +11,9 @@ dependency set** with `pyreach scan-all`, and writes one report per repo
 |------|--------------|------------|-----------|-----------|---------------|
 | Flask (2023 pins) | 6 | 4 | 0 | 9 | 0 |
 | requests (2023 pins) | 4 | 2 | 1 | 2 | 0 |
-| httpx (2023 pins) | 4 | 3 | 1 | 7 | 0 |
-| **total** | **14** | **9** | **2** | **18** | **0** |
+| httpx (2023 pins) | 4 | 3 | 1 | 1 | 6 |
+| yamllint (2023 pins) | 2 | 1 | 0 | 0 | 7 |
+| **total** | **16** | **10** | **2** | **12** | **13** |
 
 The two reachable findings (recorded 19 Nov 2026):
 
@@ -25,12 +26,60 @@ The two reachable findings (recorded 19 Nov 2026):
   Path: `URL.__init__ → urlparse → encode_host → idna.encode` — every
   URL httpx parses goes through `idna.encode`.
 
-Everything else is **uncertain, with a pre-seeded deterministic
-explanation** for each one (blocker, evidence, what is not known, and one
-discriminating check). Nothing in the demo calls an LLM: the explanations
+The 12 uncertain findings each carry a **pre-seeded deterministic
+explanation** (blocker, evidence, what is not known, and one
+discriminating check). The 13 not_reachable findings (7 yamllint +
+6 httpx) carry no explanation — there is nothing uncertain left to
+explain — and 2 of them come with an OpenVEX `not_affected` statement
+(yamllint's GHSA-8q59-q68h-6hv4 and httpx's GHSA-82r6-8w77-94w6). Nothing in the demo calls an LLM: the explanations
 are the deterministic explainer's output (`--explain --no-llm`), computed
 ahead of time and stored in the reports. The LLM explainer is left out
 on purpose — it depends on a free-model API whose slugs get delisted.
+
+## yamllint — the not_reachable demo (Phase 13, 19 Nov 2026)
+
+yamllint is the fourth repo because it is the one that proves the tool
+can clear an alert, not just find or shrug at one: **7/7 not_reachable,
+0% uncertain, plus 1 OpenVEX `not_affected` statement** for
+GHSA-8q59-q68h-6hv4 (PyYAML 5.3.1). It only ever uses `yaml.safe_load`
+and `yaml.SafeLoader` — never `yaml.load` with the unsafe Loader, never
+`full_load`, never `FullLoader`. Two Phase 13 features make that provable:
+
+- **Loader-aware verdicts**: the tool records the Loader argument at
+  every call into `yaml.load` (including `safe_load`, which is
+  `load(stream, SafeLoader)`). yamllint reaches `yaml.load` only
+  through `SafeLoader`, so `yaml.load` and the three
+  `FullConstructor.construct_*` internals flip from reachable to
+  not_reachable — with the loader named in the reason. Any unsafe or
+  unknown loader anywhere reachable blocks the flip (MkDocs keeps its
+  4 reachable for exactly that reason: its wrapper passes
+  `Loader=yaml.Loader`).
+- **Resolver reorder**: the three remaining candidates (`FullLoader`,
+  `full_load`, `yaml.full_load`) were blocked by dynamic sites whose
+  names are literals (`getattr(rule, 'CONF')`, `getattr(rule,
+  'DEFAULT')`, `getattr(stream, 'name')` in PyYAML's reader). Constant
+  propagation on the name now runs before the receiver check, so all
+  four dynamic sites resolve safe in Phase 4 and the candidates flip
+  to not_reachable. The per-advisory VEX gate (fully parsed, no
+  unresolved imports or entry points, no dynamic site left unresolved,
+  no ambiguous edge matching the advisory's targets) then emits the
+  statement — the old whole-run gate never would have, because
+  PyYAML's own code contributes 64 ambiguous edges that cannot be any
+  of these targets.
+
+yamllint's scan is the only one in the demo that passes `--with-deps`
+(it needs PyYAML's source parsed, and the sdist download needs
+network the first time; it is cached after that). The other three
+repos keep their no-deps numbers — but httpx's numbers still moved in
+Phase 13, because the resolver reorder (below) let all 7 of its
+dynamic sites resolve safe: `locals()` and four `setattr()` calls,
+which cannot call a function at all, plus `getattr(value, "name")`
+and `getattr(result, "close")`, whose names are literals. All 6
+anyio candidates that were uncertain on those sites are now
+not_reachable, and GHSA-82r6-8w77-94w6 (all four candidates cleared)
+gets the demo's second OpenVEX statement. `sys.stderr` stays
+uncertain — it is referenced in httpx's code, so the reference rule
+keeps it open.
 
 ## Why 2023 pins?
 
@@ -115,8 +164,12 @@ a path (the path breaks at `poolmanager.urlopen`, an attribute call on
 an object of unknown type). Report:
 `~/workspace/real-projects-pyreach/requests-demo-deps.json` (+ .html).
 
-One honest limit it exposed: `yaml.safe_load` calls `load(stream,
-SafeLoader)`, so with the dep parsed, yaml.load reads reachable in an
-app that only uses safe_load — the tool cannot yet tell Loader
-arguments apart. Loader-aware verdicts are follow-up work, not in
-this demo.
+That limit is now FIXED (Phase 13, 19 Nov 2026): Loader-aware
+verdicts (above) tell `safe_load` apart from unsafe `load`, so
+`app_safe --with-deps` is now 7/7 not_reachable instead of yaml.load
+reading reachable. `verify.py` section K asserts the new behaviour.
+What remains a real limit: a project whose dynamic sites cannot be
+resolved (bandit's plugin `import_module` calls) or whose files do
+not all parse (cookiecutter's 2 Jinja-template files) still goes
+uncertain — the completeness gate flips any not_reachable back when
+the project is incomplete, and that is by design.

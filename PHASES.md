@@ -1242,3 +1242,245 @@ Honest limits this feature EXPOSED (not fixed here):
 - Star re-exports in a dependency's `__init__` are not linked.
 - A dependency with no sdist, no network, or no exact version stays
   unparsed and its candidates stay uncertain, as before.
+
+## Phase 12 — second ChatGPT review: core reliability fixes (19 Nov 2026)
+
+Source: the user's `pyreach_phase9_technical_review.md` — a second
+ChatGPT review, this time of Phase 9 (rating 5.5/10, down from 6/10).
+Per the user's instruction, each claim was reasoned over and
+reproduced against the current Phase 11 code before any fix, and
+only fixes that genuinely help the hackathon demo/outcomes were
+built. No LLM-explainer work was done.
+
+### Verdict table — what the review claimed vs what reproduced
+
+| ChatGPT claim | Status vs Phase 11 | Action |
+|---|---|---|
+| Issue 1: relative imports → false not_reachable | ALREADY FIXED (Phase 10, callgraph pass-1 resolution) | Reproduced the exact example: reachable with the full path `app.main -> pkg.utils.wrapper -> pkg.inner.helper -> yaml.load`. No change. |
+| Issue 2: dependency source never parsed | FIXED in Phase 11 for real PyPI packages (`--with-deps`), but the unparsed case still produced false not_reachable + VEX | New fail-closed rule (below): a reachable call into an unparsed dependency's package blocks not_reachable for that package's candidates. |
+| Issue 3: getattr matches the wrong library | CONFIRMED — `getattr(json, "load")` was REACHABLE high for yaml.load | Receiver-aware gate (below). |
+| Issue 4: LLM can certify false not_reachable | CONFIRMED by construction (mocked answer passes the verifier) | LLM may propose reachable, never certify absence (below). |
+| §4A: dynamic reachable has empty path | CONFIRMED — Phase 4 reachable had `path: []` | Phase 4 now sets the call path (below). |
+| §4B: nested cli/main files are program roots | CONFIRMED — unimported `pkg/cli.py` top-level yaml.load was REACHABLE | Filename heuristic is root-level only (below). |
+| §4C: .env endpoint injection | CONFIRMED — a scanned project's .env (LLM_BASE_URL) was loaded into the process | Scanned-project .env is never read (below). |
+| §4D: witness is not a sandbox | Agreed, already disclosed in the CLI warning | No change — optional, trusted projects only. |
+| §4E: partial / Loader args / fix-commit coverage | Agreed, genuine limits | No change — Loader-aware verdicts are the follow-up; partial is surfaced by the reference rule. |
+| Test count 183 vs 182 | CONFIRMED — a `__main__` guard mid-file hid classes from unittest | Guard moved to end of test_resolver_phase4.py; pytest and unittest now agree (213). |
+
+### The fixes
+
+1. **Receiver-aware getattr** (`pyreach/resolver.py`,
+   `getattr_receiver()`): the receiver of a `getattr()` call is
+   resolved through the file's imports. A known receiver from another
+   module makes the site safe; an unknown receiver (a variable, an
+   attribute like `self.option`, a call) stays uncertain with no LLM
+   call at all — identity is never guessed by name. Bare vulnerable
+   names skip the gate (no module to check). `getattr(json, "load")`
+   is now not_reachable for yaml.load; `getattr(yaml, "load")` is
+   still reachable; MkDocs' `getattr(self.option, key)` at
+   config_options.py:549 stays uncertain, as it must.
+2. **Dependency-entry rule** (`pyreach/reach.py`,
+   `dep_entry_call()`, used in `analyze()` and in cli.py's Phase 4
+   all-safe flip): if reachable code calls any function of the
+   candidate's package and that package's source was not parsed, the
+   candidate is uncertain — the library may call it internally. The
+   candidate itself is excluded (a direct call is a real BFS path),
+   project code and `--with-deps`-parsed packages are excluded. This
+   is what makes the thirdparty-wrapper repro uncertain with 0 VEX,
+   and it changes `app_safe` from not_reachable to uncertain without
+   `--with-deps` (it calls `yaml.safe_load()`; with `--with-deps` it
+   is reachable via safe_load, verify.py section K — the Loader
+   limit, unchanged). The all-clear fixture/VEX case is now
+   `app_dead`, which calls no yaml function at all. Fixtures and
+   tests that asserted the old app_safe verdict were updated to the
+   new one with this reasoning recorded, not silently weakened.
+3. **LLM never certifies absence** (`pyreach/resolver.py`,
+   `resolve_getattr_case`): a verified `can_reach: false` LLM answer
+   is now treated exactly like "unknown" and returns None. Only
+   deterministic constant propagation may return not_reachable. The
+   10-rule verifier itself is unchanged (it still validates false
+   answers) — the policy sits above it.
+4. **Phase 4 reachable gets a path** (`pyreach/cli.py`): on a
+   dynamic hit, `r.path` is the BFS path to the site's caller plus
+   the target (`app.main -> app.load_config -> yaml.load`), so a
+   reachable verdict always carries evidence. The witness still
+   starts from `path[0]`, which is a real entry point.
+5. **Nested program modules** (`pyreach/entrypoints.py`): the
+   main/app/cli/__main__ filename heuristic applies to root-level
+   files only. A nested file still counts via a `__main__` guard, a
+   console script, or being imported by a program. Checked against
+   existing fixtures: `app_rel_import/pkg/main.py` has a guard, the
+   console-script fixtures resolve via their scripts — no fixture
+   depended on the nested-name rule.
+6. **Scanned-project .env is never read** (`pyreach/dotenv.py`):
+   `find_dotenv_file` no longer considers the scanned project's
+   directory. Config comes from the caller's own cwd walk-up, an
+   explicit `--env-file`, or `PYREACH_ENV_FILE`. The user's own
+   workflow is unaffected: their key lives in the pyreach repo's
+   `.env`, found by the cwd walk-up.
+
+### Verification (19 Nov 2026)
+
+- Unit suite **215/215** (was 202; +13 Phase 12 tests in
+  `tests/test_phase12.py`, and the `__main__`-guard move adds the
+  two post-guard classes to unittest's count).
+- `verify.py` offline **55 passed, 0 failed** (40 fixtures);
+  `verify.py --live` **59 passed, 0 failed** (section K still:
+  yaml 17/17 parsed, full_load + yaml.full_load not_reachable,
+  yaml.load reachable via safe_load).
+- All four ChatGPT repros re-run after the fix: relative imports
+  reachable (exact path), getattr(json) not_reachable, nested cli
+  not_reachable, dep wrapper uncertain + 0 VEX.
+- Demo re-run end to end (`bash demo/run-demo.sh`, fresh clones):
+  totals UNCHANGED — Flask 0/9, requests 1/2, httpx 1/7; 20
+  results, 2 reachable, 18 uncertain, 0 not_reachable, 18
+  pre-seeded explanations, exit 2. The demo page artifact still
+  shows the same numbers and was not rebuilt.
+
+### Deliberately NOT fixed
+
+- Witness sandboxing (§4D): a real sandbox is out of scope for the
+  remaining hours; the feature stays optional with its warning.
+- Loader-aware verdicts and `functools.partial` tracing (§4E):
+  the next core work after the demo, not a pre-demo fix.
+- Fix-commit mapping on ≥3 materially different advisories: still
+  open (mocked tests + PyYAML only).
+- Reproducible real-project JSONs in the zip: EVALUATION.md
+  documents the 7 projects; the reports live outside the repo.
+
+### Phase 12 addendum — two regressions found by re-running MkDocs (19 Nov 2026)
+
+The user's request for statistics on one project with the latest
+zip exposed two real regressions that the fixture suite had not
+caught, because no real project had been re-run since Phase 10.
+Both are fixed in this zip, with regression tests.
+
+1. **Nested `__all__` was the library surface** (`pyreach/
+   entrypoints.py`, `_dunder_all`): it took the first `__all__`
+   found by rglob anywhere, which for MkDocs was
+   mkdocs/config/__init__.py's `['load_config', 'Config']` — a
+   subpackage's surface, not the library's. Entries collapsed
+   1,092 -> 72 and the three reachable internals went uncertain.
+   Now only the top-level package's `__init__.py` counts
+   (root/__init__.py, a package dir directly under root, or a
+   src-layout package). MkDocs' top `__init__.py` has no `__all__`,
+   so the public-API fallback runs again: entries back to 1,092.
+   Regression tests in `tests/test_phase12.py` (nested `__all__`
+   ignored; src-layout `__all__` found).
+2. **Dependency internals lost the loader propagation**
+   (`pyreach/reach.py`, `_is_dep_internal` + `propagate_library_
+   internals`): with --with-deps, a merged dep function counted as
+   "project code", so `_is_library_internal` said False and the
+   loader-reachable rule never fired — the internals went uncertain
+   because PyYAML's own dispatch to them is a dict lookup, not a
+   static call edge. The propagation now also fires for dep
+   functions that are library-internal (not a public API of the
+   dep). Candidates BFS proved not_reachable are never touched.
+
+MkDocs (commit 2862536, live PyYAML 5.3.1 advisory, `--with-deps`,
+`--explain --no-llm`) after both fixes: **4 reachable / 3
+uncertain, 43% uncertain** — the same split as the Phase 9
+evaluation, now with the dependency parsed 17/17 and the reachable
+path going through the real wrapper
+`mkdocs.utils.yaml.yaml_load -> yaml.load`. Without `--with-deps`
+the split is identical (4/3, dep 0/17). The one new number is
+`dynamic_unresolved: 10` (was 2): parsing yaml's source makes its
+own dynamic dispatch sites visible; Phase 4 resolves 8/10, the 2
+still unknown are the config-driven sites at
+config_options.py:549. Full report:
+`~/workspace/real-projects-pyreach/mkdocs-report-p12.json`.
+
+## Phase 13 — Loader-aware verdicts + per-advisory VEX + not_reachable demo (19 Nov 2026)
+
+Why: the demo showed 2 reachable / 18 uncertain / 0 not_reachable, and
+the user asked (19 Nov 2026) for projects with not_reachable outputs in
+the scan and in the demo. No real project in the set produced a
+not_reachable even with --with-deps, for three distinct reasons, each
+fixed separately:
+
+1. **The Loader blind spot (the big one).** Every safe_load-only project
+   (yamllint, bandit, cookiecutter, MkDocs' tests) read yaml.load as
+   reachable, because `safe_load` literally calls `load(stream,
+   SafeLoader)` and function-level reachability cannot see the Loader
+   argument. New: `Graph.loader_calls` (`pyreach/callgraph.py`) records
+   the Loader at every call into the yaml.load family — keyword
+   `Loader=`, positional arg 2, defaults (load→Loader,
+   full_load→FullLoader), and the safe_load/full_load sugar — including
+   PyYAML's own internal `load(stream, SafeLoader)` call. New
+   `reach.apply_loader_rule(graph, results, entries)`, wired into
+   `_run_scan` after Phase 4 and before the witness: a reachable
+   yaml-family result flips to not_reachable (medium, loader named in
+   the reason) only if EVERY loader call into it from a reachable
+   caller is SafeLoader/CSafeLoader. The whole-picture rule matters:
+   BFS returns one shortest path, and a project could call yaml.load
+   safely in one place and unsafely in another. Any unsafe or unknown
+   loader, or no recorded loader step, leaves the verdict alone.
+   MkDocs keeps its 4 reachable (its wrapper passes
+   `Loader=yaml.Loader`); full_load can never flip (FullLoader by
+   definition).
+2. **The receiver gate ran before constants (Phase 12 over-conservatism).**
+   `resolve_getattr_case` returned None for any unknown receiver before
+   constant propagation ran, so literal-name sites — `getattr(rule,
+   'CONF')`, `getattr(rule, 'DEFAULT')` in yamllint,
+   `getattr(stream, 'name')` in PyYAML's reader — stayed unresolved
+   and blocked every not_reachable in the project. Now constants run
+   first (a name that can only be 'CONF' can never be yaml.load,
+   whatever the receiver is) and the receiver only disambiguates when
+   the name IS vulnerable. Also: `setattr`/`globals`/`locals`/`vars`
+   sites now resolve safe immediately — they cannot call a function;
+   `eval`/`exec`/`__import__` still stay unresolved.
+3. **The VEX gate was whole-run.** `is_complete_for_not_reachable()`
+   requires 0 ambiguous edges anywhere, and PyYAML alone contributes
+   64 inside the parsed dependency — so no --with-deps run could ever
+   emit a statement. New per-advisory gate in `cli.py` (computed at
+   the VEX block, `build_openvex` now takes a per-advisory dict):
+   fully parsed, no unresolved imports or unsupported entry points,
+   no dynamic site left unresolved after Phase 4, and no ambiguous
+   edge or unresolved-attr site matching that advisory's targets
+   (`reach._has_ambiguous_for`, `_unresolved_attr_for`). Aggregation
+   is unchanged: a statement fires only when every candidate for the
+   advisory is not_reachable.
+
+Tests: `tests/test_loader_rule.py` (16 tests: extraction incl. keyword,
+positional, variable and dep-internal loaders; the flip rule incl.
+unsafe-anywhere and no-step cases; the resolver reorder incl. the
+unknown-receiver-stays-uncertain case) and 2 per-advisory VEX tests in
+`tests/test_phase8.py`. `verify.py` section K updated: app_safe
+--with-deps is now 7/7 not_reachable + 1 OpenVEX statement (the old
+"yaml.load reachable via safe_load" expectation was the known limit
+this phase fixed). Suite: **233 unit tests**.
+
+Real-project results (19 Nov 2026, live PyYAML 5.3.1, `--with-deps`,
+`--no-llm`):
+
+- **yamllint (96246fb): 0 reachable / 0 uncertain / 7 not_reachable,
+  1 OpenVEX not_affected statement.** The first real project with a
+  not_reachable, and the demo's fourth repo. All 4 dynamic sites
+  resolve safe; yaml.load + the 3 internals flip via the loader rule.
+- **bandit (2d5467c): 0 / 7 / 0.** yaml.load + internals flip via the
+  loader rule, then the completeness gate flips them back to uncertain
+  (193/196 parsed), and the rest stay uncertain on the plugin
+  `import_module` sites that constants cannot resolve.
+- **cookiecutter (c88fbe9): 0 / 7 / 0.** Same gate story (88/90 parsed:
+  2 Jinja-template files) — the loader-flipped yaml.load is flipped
+  back by the gate. Correct fail-closed behaviour, not a bug.
+- **MkDocs (2862536): 4 / 3 / 0, unchanged** — the Loader=yaml.Loader
+  wrapper keeps yaml.load reachable, and :549 still blocks the other
+  three. Reports in `~/workspace/real-projects-pyreach/*-report-p13.json`.
+
+Demo: yamllint added as the fourth repo (`demo/requirements/
+yamllint-2023.txt`: pathspec==1.0.3, pyyaml==5.3.1;
+`demo/advisories/pyyaml.json`: the live GHSA-8q59-q68h-6hv4 advisory
+with pyreach's fix-commit mapping, 7 candidates). Only yamllint's scan
+passes `--with-deps` (`demo/run-demo.sh` `WITH_DEPS` map). The
+other three keep their no-deps scans, but httpx's numbers still moved:
+the resolver reorder let all 7 of its dynamic sites resolve safe
+(`locals()`, four `setattr()` calls, `getattr(value, "name")`,
+`getattr(result, "close")`), so 6 of its candidates flipped from
+uncertain to not_reachable and GHSA-82r6-8w77-94w6 gets an OpenVEX
+statement. Totals, verified by a full `bash demo/run-demo.sh` run
+(19 Nov 2026, ~220 s): **27 results, 2 reachable, 12 uncertain,
+13 not_reachable, 2 OpenVEX statements, 12 pre-seeded explanations**
+(Flask 0/9/0, requests 1/2/0, httpx 1/1/6, yamllint 0/0/7). The web
+demo page (slug pyreach-demo) still shows the three-repo version and
+was NOT rebuilt in this phase.

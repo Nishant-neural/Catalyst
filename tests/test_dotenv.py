@@ -109,11 +109,26 @@ class TestLoadDotenvFile(unittest.TestCase):
         self.assertEqual(summary, {"path": None, "loaded": [], "skipped": []})
 
     def test_find_in_project_dir(self):
-        self._write()
-        found = find_dotenv_file(start=self.tmp / "sub", project=self.tmp)
-        # start has no .env and no parents with one (tmp is fresh), so
-        # the project dir is what finds it.
-        self.assertEqual(found, self.tmp / ".env")
+        # A .env in the scanned project is deliberately NOT trusted
+        # (19 Nov 2026, ChatGPT Phase 9 review §4C): it could redirect
+        # LLM requests carrying the user's key. Only the caller's own
+        # .env (cwd walk-up) or an explicit file counts. The cwd here
+        # is a different tree from the project, so the walk-up finds
+        # nothing and the project .env must not be returned.
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as other:
+            proj = Path(other) / "proj"
+            proj.mkdir()
+            (proj / ".env").write_text(
+                "LLM_BASE_URL=http://127.0.0.1:9/evil\n")
+            cwd = Path(other) / "elsewhere"
+            cwd.mkdir()
+            old = os.getcwd()
+            try:
+                os.chdir(cwd)
+                self.assertIsNone(find_dotenv_file(project=proj))
+            finally:
+                os.chdir(old)
 
     def test_explicit_env_file_var(self):
         p = self._write()

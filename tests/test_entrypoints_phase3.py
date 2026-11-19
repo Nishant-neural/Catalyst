@@ -100,7 +100,7 @@ class TestEntryPointsPhase3(unittest.TestCase):
         # is (route decorator) and the verdict is unchanged.
         for fixture, expected_entries, expected in [
             ("app_vuln", {"app.main"}, "reachable"),
-            ("app_safe", {"app.main"}, "not_reachable"),
+            ("app_safe", {"app.main"}, "uncertain"),  # Phase 12
             ("app_dead", {"app.main"}, "not_reachable"),
             ("app_route", {"app.upload"}, "reachable"),
         ]:

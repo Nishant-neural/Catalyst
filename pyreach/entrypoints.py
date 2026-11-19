@@ -71,7 +71,13 @@ def _program_modules(root: Path, graph: Graph, mode: str) -> set[str]:
     for p in py_files:
         rel = str(p.relative_to(root))
         module = _entry_module(rel)
-        if p.stem in ("main", "app", "cli", "__main__"):
+        # Filename heuristic is ROOT-LEVEL ONLY (19 Nov 2026, ChatGPT
+        # Phase 9 review §4B, reproduced): a nested pkg/cli.py that is
+        # never imported, guarded or configured became a program root
+        # and its top-level yaml.load() read REACHABLE. A nested
+        # main/app/cli still counts via its __main__ guard, a console
+        # script, or being imported by a program — just not by name.
+        if p.parent == root and p.stem in ("main", "app", "cli", "__main__"):
             programs.add(module)
             continue
         try:
@@ -219,8 +225,39 @@ def _console_scripts(root: Path) -> dict[str, str]:
 
 
 def _dunder_all(root: Path) -> list[str] | None:
-    """__all__ from the top-level __init__.py, or None if absent."""
-    for init in root.rglob("__init__.py"):
+    """__all__ from the top-level package's __init__.py, or None if absent.
+
+    Only the library's own top __init__ counts: root/__init__.py, a
+    package directory directly under root, or a src-layout package
+    (root/src/<pkg>/__init__.py). A nested subpackage's __all__ is
+    that subpackage's surface, not the library's. The old
+    implementation took the first __all__ found by rglob anywhere,
+    which for MkDocs returned mkdocs/config/__init__.py's
+    ['load_config', 'Config'] — entries collapsed 1,092 -> 72 and
+    three reachable internals went uncertain (found 19 Nov 2026 by
+    re-running MkDocs with the Phase 12 zip).
+    """
+    candidates: list[Path] = []
+    top = root / "__init__.py"
+    if top.is_file():
+        candidates.append(top)
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        children = []
+    for d in children:
+        if d.is_dir() and (d / "__init__.py").is_file():
+            candidates.append(d / "__init__.py")
+    src = root / "src"
+    if src.is_dir():
+        try:
+            src_children = sorted(src.iterdir())
+        except OSError:
+            src_children = []
+        for d in src_children:
+            if d.is_dir() and (d / "__init__.py").is_file():
+                candidates.append(d / "__init__.py")
+    for init in candidates:
         try:
             tree = ast.parse(init.read_text(encoding="utf-8", errors="ignore"))
         except Exception:

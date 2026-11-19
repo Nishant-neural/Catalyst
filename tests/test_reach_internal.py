@@ -39,10 +39,13 @@ class TestLibraryInternals(unittest.TestCase):
         graph = build_graph(root)
         entries, _ = find_entrypoints(root, graph)
         results = {r.vulnerable_function: r for r in analyze([_advisory()], graph, entries)}
-        self.assertEqual(results["yaml.load"].verdict, "not_reachable")
+        # Phase 12: yaml.load is uncertain without --with-deps — the
+        # app calls yaml.safe_load() and yaml source is unparsed.
+        self.assertEqual(results["yaml.load"].verdict, "uncertain")
         # Internal must NOT be claimed not_reachable — dependency not parsed.
         self.assertEqual(results["FullConstructor.construct_python_object_new"].verdict, "uncertain")
-        self.assertEqual(results["yaml.full_load"].verdict, "not_reachable")
+        # Phase 12: same dep-entry rule as yaml.load above.
+        self.assertEqual(results["yaml.full_load"].verdict, "uncertain")
 
 
 def _same_name_advisory(confidence):

@@ -24,7 +24,12 @@ class TestCallGraphBase(unittest.TestCase):
         self.assertEqual(self._results("app_vuln")[0].verdict, "reachable")
 
     def test_safe_is_not_reachable(self):
-        self.assertEqual(self._results("app_safe")[0].verdict, "not_reachable")
+        # Phase 12 (19 Nov 2026): app_safe calls yaml.safe_load() while
+        # yaml source is unparsed, so yaml.load is uncertain without
+        # --with-deps (with it, yaml.load is reachable via safe_load).
+        # Only an app calling no yaml function at all (app_dead) is
+        # not_reachable on the sample advisory now.
+        self.assertEqual(self._results("app_safe")[0].verdict, "uncertain")
 
     def test_dead_code_is_not_reachable(self):
         self.assertEqual(self._results("app_dead")[0].verdict, "not_reachable")

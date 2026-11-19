@@ -33,7 +33,10 @@ from .entrypoints import (find_entrypoints, find_entrypoints_with_evidence,
 from .explainer import explain_result, format_explanation
 from .html_report import blocked_location, html_path_for, render_report_file, write_html_report
 from .proof import run_execution_proof
-from .reach import Result, analyze, reachable_functions, reachable_modules, site_can_run
+from .reach import (Result, analyze, apply_loader_rule, bfs_path,
+                    _has_ambiguous_for, _unresolved_attr_for,
+                    dep_entry_call, reachable_functions, reachable_modules,
+                    site_can_run)
 from .resolver import (DEFAULT_MODEL, LLM_TEST_PROMPT, build_prompt,
                        resolve_getattr_case, resolve_with_llm_status)
 from .vex import build_openvex, write_openvex
@@ -333,7 +336,8 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
             outcome = resolve_getattr_case(
                 src, d["line"], [r.vulnerable_function], set(graph.functions),
                 cache=cache, model=model, allow_llm=use_llm,
-                allow_fallback=allow_fallback)
+                allow_fallback=allow_fallback,
+                imports=graph.imports_by_file.get(d["file"], {}))
             if outcome is None:
                 unresolved += 1
                 unresolved_sites.add((d["file"], d["line"]))
@@ -352,9 +356,32 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
             resolved_safe += 1
         if hit_reason:
             r.verdict, r.confidence = "reachable", hit_conf
+            # A reachable verdict needs a call path (ChatGPT Phase 9
+            # review §4A, reproduced: getattr(json, "load") reported
+            # reachable with path []). The dynamic site's caller is
+            # reachable, so the path is entry -> ... -> caller -> target.
+            entry_path = bfs_path(graph, entries, d["caller"])
+            r.path = (entry_path + [r.vulnerable_function]
+                      if entry_path else [d["caller"],
+                                          r.vulnerable_function])
             r.reason += f" | {hit_reason}"
             print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: reachable — {hit_reason[:100]}")
         elif unresolved == 0 and resolved_safe == len(sites):
+            # Every dynamic site resolved, none can hit the target — but
+            # only if no reachable call enters the candidate's package
+            # while its source is unparsed (reach.dep_entry_call):
+            # a safe getattr site says nothing about what the library
+            # itself calls internally.
+            dep_hit = dep_entry_call(graph, entries, r.vulnerable_function)
+            if dep_hit:
+                r.reason += (f" | Phase 4: resolved all {len(sites)} dynamic "
+                             f"call site(s) safe, but reachable code calls "
+                             f"{dep_hit} and the "
+                             f"{r.vulnerable_function.split('.')[0]} source is "
+                             f"not parsed — staying uncertain")
+                print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: uncertain "
+                      f"(dynamic sites safe, but dep entry {dep_hit} unparsed)")
+                continue
             # Every dynamic site resolved, none can hit the target.
             conf = "medium" if llm_used else "high"
             r.verdict, r.confidence = "not_reachable", conf
@@ -365,6 +392,14 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
         else:
             r.reason += (f" | Phase 4: resolved {resolved_safe}/{len(sites)} dynamic "
                          f"sites safe, {unresolved} still unknown — staying uncertain")
+
+    # Loader-aware verdicts (Phase 13, 19 Nov 2026): a reachable
+    # yaml.load reached only through SafeLoader never executes the
+    # vulnerable construction code. Runs after Phase 4 so a dynamic
+    # hit is never flipped, and before the witness so a flipped
+    # result is not executed. The completeness gate below can still
+    # flip a result back to uncertain if the project is incomplete.
+    results = apply_loader_rule(graph, results, entries)
 
     # Phase 5: execution witness, reachable only. Never changes a verdict:
     # a failed run keeps the static verdict. Entry functions are passed
@@ -532,15 +567,30 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
     # OpenVEX is aggregated at the advisory level inside build_openvex
     # (ChatGPT Critical 2, 19 Nov 2026): a not_affected statement fires
     # only when EVERY candidate for the advisory is not_reachable. The
-    # old per-result rule emitted not_affected for FullLoader while the
-    # same report said yaml.load was reachable. The gate is the ledger:
-    # fully parsed, no dynamic site still unresolved after Phase 4, no
-    # ambiguous edge, no low-confidence target, no unresolved import.
+    # gate is per-advisory (Phase 13, 19 Nov 2026): fully parsed, no
+    # unresolved imports or unsupported entry points, no dynamic site
+    # still unresolved after Phase 4, and no ambiguous edge or
+    # unresolved-attr site matching that advisory's targets. The old
+    # whole-run ledger gate blocked every statement on a --with-deps
+    # run because the parsed dependency itself contributes ambiguous
+    # edges (PyYAML alone: 64) that cannot be any of the targets.
     # (Note the asymmetry is deliberate: the verdict gate above is
     # per-target, but VEX goes to downstream tooling, so it uses the
-    # stricter whole-run ledger.)
-    vex = build_openvex(results, root.name,
-                        graph_clean=ledger.is_complete_for_not_reachable())
+    # stricter per-advisory ledger.)
+    clean_by_adv: dict[str, bool] = {}
+    for adv in advisories:
+        targets = [vf.qualified for vf in adv.vulnerable_functions]
+        clean_by_adv[adv.id] = (
+            ledger.project_files_discovered == ledger.project_files_parsed
+            and not ledger.unresolved_imports
+            and not ledger.entry_points_unsupported
+            and ledger.dynamic_unresolved == 0
+            and not any(_has_ambiguous_for(graph, entries, t)
+                        for t in targets)
+            and not any(_unresolved_attr_for(graph, t, entries)
+                        for t in targets)
+        )
+    vex = build_openvex(results, root.name, graph_clean=clean_by_adv)
     write_openvex(args.vex, vex)
     print(f"\nwrote {args.out} and {args.vex}")
     if html_out is not None:
@@ -899,7 +949,7 @@ def main(argv=None) -> int:
     p.add_argument("--proof-timeout", type=int, default=10, help="Seconds per witness run (default 10)")
     p.add_argument("--cache-dir", default=".reachcache")
     p.add_argument("--env-file", default=None,
-                   help=".env file to load the API key from (default: ./.env in the current dir or the scanned project)")
+                   help=".env file to load the API key from (default: ./.env in the current dir; a .env in the scanned project is never read)")
     args = p.parse_args(argv)
 
     root = Path(args.project)

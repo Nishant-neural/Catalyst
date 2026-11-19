@@ -78,7 +78,7 @@ class TestPhase2Fixtures(unittest.TestCase):
     def test_old_fixtures_still_pass(self):
         for fixture, expected in [
             ("app_vuln", "reachable"),
-            ("app_safe", "not_reachable"),
+            ("app_safe", "uncertain"),  # Phase 12: safe_load enters yaml, dep unparsed
             ("app_dead", "not_reachable"),
             ("app_wrapper", "reachable"),
             ("app_route", "reachable"),

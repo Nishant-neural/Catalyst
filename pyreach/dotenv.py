@@ -5,8 +5,10 @@ no GPU, no LLM by default). A .env file is just KEY=VALUE lines; pulling
 in a dependency for that would be the wrong weight.
 
 What it does:
-  - Reads a .env file next to where you run pyreach, or next to the
-    project you scan (see find_dotenv_file).
+  - Reads a .env file next to where you run pyreach (see
+    find_dotenv_file). It NEVER reads a .env from the project being
+    scanned: a scanned repo is untrusted input, and its .env could
+    redirect LLM requests carrying your key (19 Nov 2026).
   - Sets keys into os.environ ONLY if they are not already set. A real
     environment variable always wins over .env — so CI / PowerShell
     `$env:OPENROUTER_API_KEY=...` is never silently overridden.
@@ -84,7 +86,11 @@ def find_dotenv_file(start: Path | None = None,
       1. PYREACH_ENV_FILE env var, if it points at an existing file.
       2. .env in the current working directory, then walking up from it
          (so running from a subfolder of the repo still finds the repo .env).
-      3. .env in the scanned project directory.
+    The scanned project directory is deliberately NOT a source
+    (19 Nov 2026, ChatGPT Phase 9 review §4C, reproduced): a malicious
+    project could ship a .env with LLM_BASE_URL pointing at an
+    attacker server, and the scan would send the user's API key there.
+    The `project` argument is kept for call compatibility and ignored.
     Returns None when there is no .env file — that is normal, not an error.
     """
     explicit = os.environ.get("PYREACH_ENV_FILE")
@@ -95,10 +101,6 @@ def find_dotenv_file(start: Path | None = None,
     cwd = Path(start) if start is not None else Path.cwd()
     for parent in [cwd, *cwd.parents]:
         cand = parent / ".env"
-        if cand.is_file():
-            return cand
-    if project is not None:
-        cand = Path(project) / ".env"
         if cand.is_file():
             return cand
     return None

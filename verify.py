@@ -2,15 +2,15 @@
 """One-command verification for pyreach, Phases 1-5 + explainer + HTML report.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+    python3 verify.py            # offline: pytest + 40 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (202 tests) — the deterministic core + explainer + HTML report + LLM status
-  B. all 38 fixtures give the expected verdict AND exit code
+  A. the unit suite (233 tests) — the deterministic core + explainer + HTML report + LLM status
+  B. all 40 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
@@ -53,7 +53,7 @@ ADV = str(ROOT / "examples" / "advisory-sample.json")
 # fixture -> (expected verdict of the first result, expected exit code)
 EXPECTED = {
     "app_vuln": ("reachable", 2),
-    "app_safe": ("not_reachable", 0),
+    "app_safe": ("uncertain", 0),      # Phase 12: safe_load enters yaml, dep unparsed
     "app_dead": ("not_reachable", 0),
     "app_getattr": ("not_reachable", 0),
     "app_wrapper": ("reachable", 2),
@@ -95,6 +95,9 @@ EXPECTED = {
     "app_init_call": ("uncertain", 0),  # Retry.__init__ reachable (unit test)
     "app_rel_import": ("uncertain", 0),  # relative import + ctor chain (unit test)
     "app_all_class": ("uncertain", 0),  # class in __all__ -> __init__ entry (unit test)
+    # Phase 12 (second ChatGPT review, 19 Nov 2026)
+    "app_getattr_json": ("not_reachable", 0),  # getattr(json, "load") != yaml.load
+    "app_nested_cli": ("not_reachable", 0),  # unimported nested cli.py is not an entry
 }
 
 passed = failed = 0
@@ -159,9 +162,9 @@ def main() -> int:
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (202 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (233 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (202 tests)", r.returncode == 0,
+        check("pytest suite (233 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -336,14 +339,17 @@ def main() -> int:
     check("app_vex_full + real advisory: reachable present, 0 VEX statements",
           len(vex1.get("statements", [])) == 0 and r.returncode == 2,
           f"statements={vex1.get('statements')} exit={r.returncode}")
-    # app_safe: the one candidate is genuinely not_reachable and the
+    # app_dead: the one candidate is genuinely not_reachable and the
     # ledger is complete, so exactly one statement is emitted.
-    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_safe",
+    # (app_safe used to be this case; Phase 12: it calls yaml.safe_load
+    # while yaml source is unparsed, so yaml.load is uncertain now —
+    # app_dead calls no yaml function at all.)
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_dead",
              "--advisory", ADV, "--no-llm", "--no-html",
              "--out", str(tmp / "j2.json"), "--vex", str(tmp / "j2-vex.json"),
              "--cache-dir", str(tmp / "cache")])
     vex2 = _read_report(tmp / "j2-vex.json") or {}
-    check("app_safe: 1 VEX statement for the all-clear advisory",
+    check("app_dead: 1 VEX statement for the all-clear advisory",
           len(vex2.get("statements", [])) == 1
           and vex2["statements"][0]["status"] == "not_affected"
           and r.returncode == 0,
@@ -398,10 +404,22 @@ def main() -> int:
                   by_fn.get("full_load") == "not_reachable"
                   and by_fn.get("yaml.full_load") == "not_reachable",
                   f"verdicts={by_fn}")
-            check("app_safe --with-deps: yaml.load reachable via safe_load "
-                  "(Loader args not distinguished — known limit)",
-                  by_fn.get("yaml.load") == "reachable",
+            check("app_safe --with-deps: yaml.load not_reachable "
+                  "(loader-aware: reached only through SafeLoader, Phase 13)",
+                  by_fn.get("yaml.load") == "not_reachable",
                   f"verdicts={by_fn}")
+            check("app_safe --with-deps: 7/7 not_reachable + 1 OpenVEX statement",
+                  all(v == "not_reachable" for v in by_fn.values())
+                  and len(by_fn) == 7,
+                  f"verdicts={by_fn}")
+            try:
+                vex = json.loads((tmp / "safe-deps-vex.json").read_text(encoding="utf-8"))
+                n_vex = len(vex.get("statements", []))
+            except Exception:
+                n_vex = -1
+            check("app_safe --with-deps: 1 OpenVEX not_affected statement "
+                  "(per-advisory VEX gate, Phase 13)",
+                  n_vex == 1, f"statements={n_vex}")
 
     print(f"\n{passed} passed, {failed} failed")
     return 0 if failed == 0 else 1

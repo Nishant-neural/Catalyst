@@ -152,10 +152,6 @@ class TestPhase4FixturesEndToEnd(unittest.TestCase):
         self.assertIn("yaml.load", results[0].path[-1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestPhase4Aggregation(unittest.TestCase):
     """19 Nov 2026 regression: one safe dynamic site must not clear a
     result when another site is unresolvable. The real PyYAML 5.3.1
@@ -210,3 +206,7 @@ class TestPromptContract(unittest.TestCase):
         self.assertIn("can_reach false needs non-empty possible_values",
                       failures)
         self.assertTrue(any("below threshold" in f for f in failures))
+
+
+if __name__ == "__main__":
+    unittest.main()
