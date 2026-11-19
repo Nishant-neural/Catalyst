@@ -51,29 +51,159 @@ def bfs_path(graph: Graph, starts: set[str], target: str) -> list[str] | None:
     return None
 
 
-def _has_dynamic_near(graph: Graph, starts: set[str]) -> bool:
-    """True if any dynamic trigger is reachable from starts."""
-    visited: set[str] = set(starts)
+def reachable_functions(graph: Graph, starts: set[str]) -> set[str]:
+    """Functions reachable from starts over static edges (BFS). Shared by
+    the dynamic/ambiguous checks so they only count triggers in code
+    that can actually execute from an entry point."""
+    seen: set[str] = set(starts)
     q: deque[str] = deque(starts)
     while q:
         cur = q.popleft()
-        for d in graph.dynamic:
-            if d["caller"] == cur:
-                return True
         for nxt in graph.edges.get(cur, set()):
-            if nxt not in visited:
-                visited.add(nxt)
+            if nxt not in seen:
+                seen.add(nxt)
                 q.append(nxt)
+    return seen
+
+
+def reachable_modules(graph: Graph, starts: set[str]) -> set[str]:
+    """Modules that can execute: modules of entry functions + modules
+    they import, transitively (over graph.file_imports)."""
+    seeds: set[str] = set()
+    for s in starts:
+        info = graph.functions.get(s)
+        if info is not None:
+            mod = graph.module_by_file.get(info.file)
+            if mod is not None:
+                seeds.add(mod)
+    reached = set(seeds)
+    stack = list(seeds)
+    while stack:
+        cur = stack.pop()
+        for nxt in graph.file_imports.get(cur, set()):
+            if nxt not in reached:
+                reached.add(nxt)
+                stack.append(nxt)
+    return reached
+
+
+def site_can_run(graph: Graph, starts: set[str], reached: set[str],
+                 modules: set[str], site: dict) -> bool:
+    """Can the code at this dynamic / unresolved-attr site execute?
+    True if its caller is reachable from entries over static edges, or
+    it sits in module top-level code of a reachable module, or in an
+    implicitly-invoked dunder method (e.g. __getattr__) of a reachable
+    module. A dunder is never called by name, so BFS alone misses it —
+    but attribute access invokes it at runtime, so a dynamic site
+    inside it is a real hole. Found 19 Nov 2026 on MkDocs: the
+    config_options.py:549 getattr inside Optional.__getattr__ was
+    dropped by the BFS-only filter, so Phase 4 claimed 'all 5 sites
+    resolved' while 2 real sites were never examined."""
+    caller = site["caller"]
+    if caller in reached:
+        return True
+    mod = graph.module_by_file.get(site["file"])
+    if mod is None or mod not in modules:
+        return False
+    if caller.endswith(".<module>"):
+        return True
+    fname = caller.split(".")[-1]
+    return fname.startswith("__") and fname.endswith("__")
+
+
+def _has_dynamic_near(graph: Graph, starts: set[str]) -> bool:
+    """True if any dynamic trigger is in code that can execute."""
+    reached = reachable_functions(graph, starts)
+    modules = reachable_modules(graph, starts)
+    return any(site_can_run(graph, starts, reached, modules, d)
+               for d in graph.dynamic)
+
+
+def _has_ambiguous_for(graph: Graph, starts: set[str], target: str) -> bool:
+    """True if an ambiguous edge in code that can execute could resolve
+    to the target. Target-specific (19 Nov 2026): an ambiguous call to
+    unrelated names in dead code no longer blocks not_reachable for
+    this target."""
+    reached = reachable_functions(graph, starts)
+    modules = reachable_modules(graph, starts)
+    simple = target.split(".")[-1]
+    for caller, cands in graph.ambiguous.items():
+        info = graph.functions.get(caller)
+        site = {"caller": caller, "file": info.file if info else ""}
+        if not site_can_run(graph, starts, reached, modules, site):
+            continue
+        if any(c == target or c.endswith("." + target)
+               or c.split(".")[-1] == simple for c in cands):
+            return True
     return False
 
 
-def _is_library_internal(qualified: str) -> bool:
-    """True for functions the project never calls directly — the library
-    calls them internally. E.g. FullConstructor.construct_python_object_new.
-    Public APIs the project calls (yaml.load, yaml.full_load) are NOT internal.
-    Note: add_multi_constructor is the registration call, not a vulnerable
-    function — it is not internal either, it is just not a candidate."""
-    return "construct_" in qualified
+def _is_project_function(graph: Graph, target: str) -> bool:
+    """True if the target is a function defined in project code (not an
+    external library node)."""
+    return any(
+        (t == target or t.endswith("." + target)
+         or t.split(".")[-1] == target)
+        and graph.functions[t].file != "external"
+        for t in graph.functions
+    )
+
+
+def _is_library_internal(qualified: str, graph: Graph) -> bool:
+    """General rule (19 Nov 2026, replaces the old 'construct_' heuristic,
+    which only covered PyYAML constructors): a candidate is
+    library-internal when the project never calls it directly AND it is
+    not addressable as a public API name from project code. Public =
+    its first dotted segment is a module the project imports (yaml.load
+    — the project imports yaml), or it is a bare name (full_load,
+    FullLoader — importable from the package top level), or it is a
+    project function. Anything else (FullConstructor.construct_python_
+    object) can only be reached through the dependency's own code, which
+    was not parsed — so it cannot be not_reachable."""
+    if _is_project_function(graph, qualified):
+        return False
+    if "." not in qualified:
+        return False  # bare name: top-level package API
+    return qualified.split(".")[0] not in graph.imported_modules
+
+
+def _unresolved_attr_for(graph: Graph, target: str, starts: set[str]) -> list[dict]:
+    """Unresolved attribute call sites whose attribute name is the
+    target's simple name (ChatGPT Critical 1, 19 Nov 2026): parser.load()
+    where parser's type is unknown may invoke the target, so it must
+    block not_reachable. Sites with other attribute names cannot call
+    this target (the attribute name is fixed), so they do not block it.
+    Only sites in code that can execute count (site_can_run): an
+    unresolved call in a dead module is not a hole."""
+    simple = target.split(".")[-1]
+    reached = reachable_functions(graph, starts)
+    modules = reachable_modules(graph, starts)
+    return [u for u in graph.unresolved_attrs
+            if u["attr"] == simple
+            and site_can_run(graph, starts, reached, modules, u)]
+
+
+def _referenced_in_project(graph: Graph, target: str) -> bool:
+    """True if the target's name is referenced in project code without
+    being called (ChatGPT Critical 2: Loader=yaml.FullLoader). Such a
+    reference may be invoked later — by the framework, a callback, a
+    registry — so the target cannot be not_reachable."""
+    if target in graph.referenced_dotted:
+        return True
+    simple = target.split(".")[-1]
+    if "." not in target:
+        # Bare candidate (FullLoader, full_load): a dotted reference to
+        # it (yaml.FullLoader as an argument) counts, and so does a bare
+        # imported name (from yaml import full_load; Loader=full_load).
+        if any(d.endswith("." + target) for d in graph.referenced_dotted):
+            return True
+    for vals in graph.imports_by_file.values():
+        for local, qualified in vals.items():
+            if qualified == target and local in graph.referenced_names:
+                return True
+    if "." not in target and simple in graph.referenced_names:
+        return True
+    return False
 
 
 def _target_in_graph(graph: Graph, target: str) -> bool:
@@ -81,7 +211,7 @@ def _target_in_graph(graph: Graph, target: str) -> bool:
                for t in graph.functions)
 
 
-def propagate_library_internals(results: list[Result]) -> list[Result]:
+def propagate_library_internals(results: list[Result], graph: Graph) -> list[Result]:
     """If a public loader (yaml.load / yaml.full_load) is reachable, then a
     library-internal constructor it uses internally is reachable too, even
     though the project never calls it directly and the dependency source
@@ -99,7 +229,7 @@ def propagate_library_internals(results: list[Result]) -> list[Result]:
             continue
         api = apis[0]
         for r in rs:
-            if r.verdict == "uncertain" and _is_library_internal(r.vulnerable_function):
+            if r.verdict == "uncertain" and _is_library_internal(r.vulnerable_function, graph):
                 r.verdict = "reachable"
                 r.confidence = "medium"
                 r.path = list(api.path) + [r.vulnerable_function]
@@ -137,7 +267,7 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
             # never calls directly: we cannot prove not_reachable, because
             # the dependency source was not parsed and the library may call
             # it internally when a public API is used. Fail closed -> uncertain.
-            if _is_library_internal(vf.qualified) and not _target_in_graph(graph, vf.qualified):
+            if _is_library_internal(vf.qualified, graph) and not _target_in_graph(graph, vf.qualified):
                 results.append(Result(
                     advisory_id=adv.id, package=adv.package,
                     vulnerable_function=vf.qualified, verdict="uncertain",
@@ -148,6 +278,36 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
                     function_confidence=vf.confidence,
                 ))
                 continue
+            # No path. An unresolved attribute call with the target's
+            # simple name (parser.load() where parser's type is unknown)
+            # may invoke it — never not_reachable (Critical 1).
+            attr_sites = _unresolved_attr_for(graph, vf.qualified, entrypoints)
+            if attr_sites:
+                site = attr_sites[0]
+                results.append(Result(
+                    advisory_id=adv.id, package=adv.package,
+                    vulnerable_function=vf.qualified, verdict="uncertain",
+                    confidence="low", path=[],
+                    reason=(f"No static path found, but an unresolved attribute call "
+                            f".{site['attr']}() at {site['file']}:{site['line']} may "
+                            f"invoke {vf.qualified} (object type unknown)."),
+                    function_confidence=vf.confidence,
+                ))
+                continue
+            # No path, but the target's name is referenced without being
+            # called (Loader=yaml.FullLoader): it may be invoked through
+            # the reference, so it cannot be not_reachable (Critical 2).
+            if _referenced_in_project(graph, vf.qualified):
+                results.append(Result(
+                    advisory_id=adv.id, package=adv.package,
+                    vulnerable_function=vf.qualified, verdict="uncertain",
+                    confidence="low", path=[],
+                    reason=(f"No static path found, but {vf.qualified} is referenced "
+                            f"in project code without being called (e.g. passed as an "
+                            f"argument) and may be invoked through that reference."),
+                    function_confidence=vf.confidence,
+                ))
+                continue
             # No path. Can we safely say not_reachable?
             if vf.confidence == "low":
                 verdict, conf = "uncertain", "low"
@@ -155,9 +315,9 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
             elif dynamic_near:
                 verdict, conf = "uncertain", "low"
                 reason = "No static path found, but a dynamic trigger (getattr/importlib/plugin) is reachable, so a hidden path may exist."
-            elif graph.ambiguous:
+            elif _has_ambiguous_for(graph, entrypoints, vf.qualified):
                 verdict, conf = "uncertain", "medium"
-                reason = "No static path found, but ambiguous calls exist that could resolve to the vulnerable function."
+                reason = "No static path found, but an ambiguous call in reachable code could resolve to the vulnerable function."
             else:
                 verdict, conf = "not_reachable", "high" if vf.confidence == "high" else "medium"
                 reason = "BFS from all real entry points found no path, no dynamic trigger, no ambiguous edge."
@@ -167,4 +327,4 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
                 confidence=conf, path=[], reason=reason,
                 function_confidence=vf.confidence,
             ))
-    return propagate_library_internals(results)
+    return propagate_library_internals(results, graph)

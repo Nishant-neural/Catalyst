@@ -17,20 +17,23 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from .advisory import load_advisories
+from .deps import advisory_file_for, normalize_name, resolve_dependencies
 from .dotenv import load_dotenv_file
 from .phase1 import analyse_advisory_live, save_advisories
 from .callgraph import build_graph
 from .cache import Cache
 from .completeness import Ledger
 from .debate import format_pr_comment
-from .entrypoints import find_entrypoints, find_entrypoints_with_evidence
+from .entrypoints import (find_entrypoints, find_entrypoints_with_evidence,
+                          find_unsupported_entrypoints)
 from .explainer import explain_result, format_explanation
 from .html_report import blocked_location, html_path_for, render_report_file, write_html_report
 from .proof import run_execution_proof
-from .reach import Result, analyze
+from .reach import Result, analyze, reachable_functions, reachable_modules, site_can_run
 from .resolver import (DEFAULT_MODEL, LLM_TEST_PROMPT, build_prompt,
                        resolve_getattr_case, resolve_with_llm_status)
 from .vex import build_openvex, write_openvex
@@ -130,6 +133,484 @@ def resolve_model_choice(explicit_model: str | None) -> tuple[str, bool]:
     if explicit_model is None:
         return DEFAULT_MODEL, True
     return explicit_model, False
+
+
+def _dependency_coverage(advisories, graph) -> tuple[int, int]:
+    """Modules discovered vs parsed for the vulnerable dependencies
+    (ChatGPT §5, 19 Nov 2026). Discovered: .py files under the installed
+    package, found via the import names the advisories' candidates use
+    (yaml.load -> yaml). Parsed: 0 — pyreach does not parse dependency
+    source yet, and the ledger must say so honestly instead of 0/0. The
+    internal-target rule in reach.py is what keeps those candidates
+    uncertain until dependency source is parsed."""
+    discovered = 0
+    seen: set[str] = set()
+    for adv in advisories:
+        for vf in adv.vulnerable_functions:
+            first = vf.qualified.split(".")[0] if vf.qualified else ""
+            if not first or first in seen:
+                continue
+            seen.add(first)
+            try:
+                import importlib.util
+                spec = importlib.util.find_spec(first)
+            except Exception:
+                spec = None
+            if spec is None or not spec.origin:
+                continue
+            p = Path(spec.origin)
+            try:
+                if p.name == "__init__.py":
+                    discovered += len(list(p.parent.rglob("*.py")))
+                elif p.suffix == ".py":
+                    discovered += 1
+            except OSError:
+                pass
+    return discovered, 0
+
+
+def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
+              args, packages=None):
+    """Phases 2-5 + explainer + report for one advisory list.
+
+    Shared by `scan` (one package) and `scan-all` (all advisories from
+    every pinned dependency, one combined list). The call graph is built
+    once per call; scan-all therefore builds it once for all packages,
+    not once per package. `args` is the scan argument namespace
+    (out/vex/with_proof/explain/verbose/no_html/llm_debug/proof_timeout/
+    print_prompt). `packages`, when given, is the scan-all package table
+    (filled with per-package result counts here, before the report is
+    written). Returns (report_dict, exit_code).
+    """
+    graph = build_graph(root)
+    entries, entry_note = find_entrypoints(root, graph)
+    # Quiet by default: the terminal is a summary, not a dump. A full
+    # entry-point list on a real project is 1,194 names on one line
+    # (MkDocs, 19 Nov 2026) — it belongs in report.json, not stdout.
+    if args.verbose:
+        print(f"entry points ({entry_note}): {sorted(entries)}")
+    else:
+        print(f"entry points ({entry_note}): {len(entries)}")
+    print(f"functions: {len(graph.functions)}, edges: {sum(len(v) for v in graph.edges.values())}, dynamic triggers: {len(graph.dynamic)}")
+
+    results = analyze(advisories, graph, entries)
+
+    # Completeness ledger — core, not a write-up item (ChatGPT fix)
+    dep_discovered, dep_parsed = _dependency_coverage(advisories, graph)
+    ledger = Ledger(
+        project_files_discovered=len(list(root.rglob("*.py"))),
+        project_files_parsed=len({f.file for f in graph.functions.values() if f.file != "external"}),
+        dependency_modules_discovered=dep_discovered,
+        dependency_modules_parsed=dep_parsed,
+        unresolved_imports=list(graph.unresolved_imports),
+        entry_points_unsupported=find_unsupported_entrypoints(root, graph),
+        dynamic_unresolved=len(graph.dynamic),
+        ambiguous_edges=sum(len(v) for v in graph.ambiguous.values()),
+        unresolved_attribute_calls=len(graph.unresolved_attrs),
+        entry_points_identified=len(entries),
+        vulnerable_targets_high=sum(1 for a in advisories for f in a.vulnerable_functions if f.confidence == "high"),
+        vulnerable_targets_low=sum(1 for a in advisories for f in a.vulnerable_functions if f.confidence == "low"),
+    )
+    evidence = find_entrypoints_with_evidence(root, graph)
+    # Same rule: the whole evidence dict (1,194 entries on MkDocs) is
+    # in report.json as entry_evidence; the terminal gets a count.
+    if args.verbose:
+        print(f"entry evidence: {evidence}")
+    else:
+        print(f"entry evidence: {len(evidence)} entries (see report.json)")
+    print(f"completeness: {ledger.to_dict()}")
+
+    # Phase 4: deterministic constant propagation FIRST, LLM only for
+    # what it cannot resolve. Aggregation rule (19 Nov 2026 fix — the
+    # real PyYAML 5.3.1 sdist caught this): ONE dynamic site's answer
+    # decides ONE site, never the whole result. The old code took the
+    # first site that resolved to a literal list and let it decide:
+    # a single getattr with name "encoding" marked all 7 PyYAML
+    # candidates not_reachable, including yaml.load, which the test
+    # suite genuinely calls. Correct rule:
+    #   - any site resolving to the vulnerable name -> reachable
+    #   - ALL sites resolved safe, none unknown -> not_reachable
+    #   - otherwise -> stay uncertain, and say how many sites resolved
+    # --print-prompt shows the grounded prompt without calling any model,
+    # so the resolver is demoable with no API key at all.
+    # Only dynamic sites in code that can execute are tried (see
+    # reach.site_can_run): a site in dead code can neither call anything
+    # nor hide a path, and (19 Nov 2026, ChatGPT review) a dead-code site
+    # must not flip a verdict to reachable either. But a site inside a
+    # dunder method of a reachable module (e.g. __getattr__) DOES run —
+    # BFS alone misses it, and the old BFS-only filter silently dropped
+    # MkDocs' config_options.py:549 site that way.
+    reached = reachable_functions(graph, entries)
+    modules = reachable_modules(graph, entries)
+    reachable_sites = [d for d in graph.dynamic
+                       if site_can_run(graph, entries, reached, modules, d)]
+    unresolved_sites: set[tuple[str, int]] = set()
+    for r in results:
+        if r.verdict != "uncertain" or not reachable_sites:
+            continue
+        sites = reachable_sites
+        resolved_safe = 0
+        unresolved = 0
+        llm_used = False
+        hit_reason = ""
+        hit_conf = "high"
+        for d in sites:
+            try:
+                src = Path(d["file"]).read_text(encoding="utf-8", errors="ignore")
+            except OSError:
+                unresolved += 1
+                unresolved_sites.add((d["file"], d["line"]))
+                continue
+            if args.print_prompt:
+                # Demo: first site only, not all 51 of them.
+                if d is sites[0]:
+                    lines = src.splitlines()
+                    lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
+                    snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
+                    same_file = sorted(q for q in graph.functions
+                                       if graph.functions[q].file == d["file"])
+                    from .resolver import extract_string_literals
+                    print(build_prompt(snippet, same_file, extract_string_literals(src),
+                                       [r.vulnerable_function], d["file"], d["line"]))
+                    print(f"# ... and {len(sites) - 1} more dynamic sites "
+                          f"(a key in .env enables the resolver for them all)")
+                continue
+            outcome = resolve_getattr_case(
+                src, d["line"], [r.vulnerable_function], set(graph.functions),
+                cache=cache, model=model, allow_llm=use_llm,
+                allow_fallback=allow_fallback)
+            if outcome is None:
+                unresolved += 1
+                unresolved_sites.add((d["file"], d["line"]))
+                continue
+            if outcome.get("_verification_failed"):
+                print(f"LLM resolver for {r.advisory_id}: {outcome['reason']}")
+                unresolved += 1
+                unresolved_sites.add((d["file"], d["line"]))
+                continue
+            if "LLM resolver" in outcome["reason"]:
+                llm_used = True
+            if outcome["verdict"] == "reachable":
+                hit_reason = outcome["reason"]
+                hit_conf = outcome["confidence"]
+                break
+            resolved_safe += 1
+        if hit_reason:
+            r.verdict, r.confidence = "reachable", hit_conf
+            r.reason += f" | {hit_reason}"
+            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: reachable — {hit_reason[:100]}")
+        elif unresolved == 0 and resolved_safe == len(sites):
+            # Every dynamic site resolved, none can hit the target.
+            conf = "medium" if llm_used else "high"
+            r.verdict, r.confidence = "not_reachable", conf
+            r.reason = (f"No static path. Phase 4 resolved all {len(sites)} "
+                        f"dynamic call site(s); none can reach {r.vulnerable_function}.")
+            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: not_reachable "
+                  f"({conf}, all {len(sites)} dynamic sites resolved safe)")
+        else:
+            r.reason += (f" | Phase 4: resolved {resolved_safe}/{len(sites)} dynamic "
+                         f"sites safe, {unresolved} still unknown — staying uncertain")
+
+    # Phase 5: execution witness, reachable only. Never changes a verdict:
+    # a failed run keeps the static verdict. Entry functions are passed
+    # as dotted paths relative to their module (mod.Class.method works,
+    # <module> means import-only).
+    proofs = {}
+    if args.with_proof:
+        # The witness runs project code in a subprocess with the current
+        # interpreter. That is not a sandbox (ChatGPT review, 19 Nov 2026):
+        # use --with-proof only on projects you trust.
+        print("proof: runs project code in a subprocess — not a sandbox; use only on trusted projects")
+        for r in results:
+            if r.verdict != "reachable" or not r.path:
+                continue
+            entry_q = r.path[0]
+            if entry_q not in graph.functions:
+                continue
+            entry_file = str(Path(graph.functions[entry_q].file).resolve())
+            # Strip the module prefix: app.Loader.load_config -> Loader.load_config
+            mod = entry_q.rsplit(".", 1)[0] if "." in entry_q else ""
+            entry_func = entry_q[len(mod) + 1:] if mod and entry_q.startswith(mod + ".") else entry_q.split(".")[-1]
+            proof = run_execution_proof(str(root), entry_file, entry_func,
+                                        r.vulnerable_function, timeout=args.proof_timeout)
+            proofs[r.advisory_id] = proof
+            print(f"proof {r.advisory_id}: vulnerable_hit={proof['vulnerable_hit']} trace={proof['trace'][:5]} error={proof['error']}")
+
+    # Ledger is stale after Phase 4 resolution: a dynamic case resolved
+    # by constant propagation / verified LLM is no longer unresolved.
+    # dynamic_unresolved now means what it says — dynamic sites still
+    # unknown after Phase 4 (19 Nov 2026 fix: it used to be overwritten
+    # with the count of uncertain results, which made
+    # is_complete_for_not_reachable() false whenever anything was
+    # uncertain, even for unrelated reasons).
+    ledger.dynamic_unresolved = len(unresolved_sites)
+    ledger.ambiguous_edges = sum(len(v) for v in graph.ambiguous.values())
+    # Completeness gate (ChatGPT §5, 19 Nov 2026): a not_reachable verdict
+    # stands only if the analysis actually covered what it claims.
+    # analyze() already enforces the per-target conditions (dynamic,
+    # ambiguous, unresolved attrs, references, internals); this gate
+    # catches the ledger-level holes it cannot see — files that failed
+    # to parse, imports that did not resolve, entry points we could not
+    # model. A result flipped here was never proven safe, only unexamined.
+    if (ledger.project_files_discovered != ledger.project_files_parsed
+            or ledger.unresolved_imports or ledger.entry_points_unsupported):
+        for r in results:
+            if r.verdict == "not_reachable":
+                r.verdict, r.confidence = "uncertain", "low"
+                r.reason += (" | Completeness gate: not_reachable requires full "
+                             "coverage (unparsed files / unresolved imports / "
+                             "unsupported entry points).")
+    total = len(results) or 1
+    uncertain_rate = sum(1 for r in results if r.verdict == "uncertain") / total
+    print(f"uncertain rate: {uncertain_rate:.0%} ({sum(1 for r in results if r.verdict == 'uncertain')}/{len(results)}) — a tool that labels everything uncertain gets 0 false not-reachable without solving anything, so report this metric.")
+
+    # Explainer: deterministic first, LLM layer only if enabled. Runs
+    # AFTER Phase 4 resolution, so explanations describe final verdicts.
+    # Never changes a verdict; the LLM output is verified before display.
+    explanations = []
+    if args.explain:
+        uncertain_results = [r for r in results if r.verdict == "uncertain"]
+        if not uncertain_results:
+            print("explain: no uncertain results to explain.")
+        for r in uncertain_results:
+            adv = next((a for a in advisories if a.id == r.advisory_id), None)
+            exp = explain_result(
+                r, graph, root,
+                {"id": r.advisory_id, "package": r.package,
+                 "fixed_version": adv.fixed_version if adv else ""},
+                entries, use_llm=use_llm, model=model, cache=cache,
+                allow_fallback=allow_fallback)
+            explanations.append({
+                "vulnerable_function": exp["vulnerable_function"],
+                "advisory_id": exp["advisory_id"],
+                "blocker": exp["blocker"],
+                "deterministic_explanation": exp["deterministic_explanation"],
+                "llm_explanation": exp["llm_explanation"],
+                "llm_rejected": exp["llm_rejected"],
+                # The diagnostic: what the LLM layer actually did for
+                # this result (ok / rejected / no_key / timeout /
+                # rate_limited / ... / not_called). llm_enabled only
+                # proves a key was found, never that a call succeeded.
+                "llm_status": exp.get("llm_status", "not_called"),
+                "llm_error": exp.get("llm_error"),
+                # Which model produced (or was last tried for) this
+                # explanation — not always the default, when the
+                # fallback chain switched models on a delisted 404.
+                "llm_model": exp.get("llm_model"),
+                "discriminating_check": exp["discriminating_check"],
+                "does_not_know": exp["does_not_know"],
+                "evidence_pack_tokens": exp["evidence_pack_tokens"],
+            })
+            # Quiet by default: ONE line per uncertain result. The full
+            # explanation text (deterministic + LLM layer) is in
+            # report.json and in the HTML report — printing it all made
+            # a MkDocs scan ~240KB of terminal output. --verbose
+            # restores the old full dump for debugging.
+            if args.verbose:
+                print()
+                print(format_explanation(exp))
+            else:
+                loc = blocked_location(exp["deterministic_explanation"])
+                print(f"explain [uncertain] {exp['vulnerable_function']} — "
+                      f"blocker {exp['blocker']}"
+                      + (f", blocked at {loc}" if loc else "")
+                      + f" (full explanation in {html_path_for(args.out).name})")
+        # One line saying what the LLM layer actually did. Before this
+        # fix, llm_explanation null + llm_rejected false looked like
+        # "rejected" or "not tried" — it was neither: the call itself
+        # had failed silently (no key / timeout / 429 / bad JSON).
+        if explanations:
+            print(llm_explainer_summary(explanations))
+            if args.llm_debug:
+                _print_llm_debug(explanations)
+    html_name = None if args.no_html else html_path_for(args.out).name
+    report = {
+        "project": str(root),
+        "html_report": html_name,
+        # Phase 3: provenance — which advisory, which fix commit, how many
+        # candidates, so a judge can reproduce the run from the report alone.
+        "advisories": [
+            {"id": a.id, "package": a.package, "fixed_version": a.fixed_version,
+             "fix_commit": a.fix_commit if isinstance(a.fix_commit, str) else "",
+             "candidates": len(a.vulnerable_functions)}
+            for a in advisories
+        ],
+        "entry_note": entry_note,
+        "entry_evidence": evidence,
+        "llm_enabled": use_llm,
+        "completeness_ledger": ledger.to_dict(),
+        "uncertain_rate": uncertain_rate,
+        "cache": {"hits": cache.hits, "misses": cache.misses},
+        "results": [
+            {"advisory_id": r.advisory_id, "package": r.package,
+             "vulnerable_function": r.vulnerable_function, "verdict": r.verdict,
+             "confidence": r.confidence, "path": r.path, "reason": r.reason}
+            for r in results
+        ],
+        "proofs": proofs,
+        "explanations": explanations,
+        "pr_comments": [format_pr_comment(r, entry_note) for r in results],
+    }
+    # Phase 7 (scan-all): fill per-package result counts from the
+    # aggregated results, and tag the report mode. Single-package scans
+    # keep their old shape: no "packages" key, mode "scan".
+    if packages is not None:
+        for pkg in packages:
+            if pkg.get("status") in ("scanned", "no-advisories"):
+                prs = [r for r in results
+                       if normalize_name(r.package) == normalize_name(pkg["name"])]
+                pkg["results"] = {
+                    v: sum(1 for r in prs if r.verdict == v)
+                    for v in ("reachable", "not_reachable", "uncertain")}
+                pkg["total_results"] = len(prs)
+        report["mode"] = "scan-all"
+        report["packages"] = packages
+    else:
+        report["mode"] = "scan"
+    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
+    # Readable HTML interface, written next to the JSON report unless
+    # --no-html was given. It renders report.json data only, so it can
+    # be regenerated later with `pyreach report --report <report.json>`.
+    html_out = None
+    if not args.no_html:
+        html_out = write_html_report(report, args.out)
+    # OpenVEX is aggregated at the advisory level inside build_openvex
+    # (ChatGPT Critical 2, 19 Nov 2026): a not_affected statement fires
+    # only when EVERY candidate for the advisory is not_reachable. The
+    # old per-result rule emitted not_affected for FullLoader while the
+    # same report said yaml.load was reachable. The gate is the ledger:
+    # fully parsed, no dynamic site still unresolved after Phase 4, no
+    # ambiguous edge, no low-confidence target, no unresolved import.
+    # (Note the asymmetry is deliberate: the verdict gate above is
+    # per-target, but VEX goes to downstream tooling, so it uses the
+    # stricter whole-run ledger.)
+    vex = build_openvex(results, root.name,
+                        graph_clean=ledger.is_complete_for_not_reachable())
+    write_openvex(args.vex, vex)
+    print(f"\nwrote {args.out} and {args.vex}")
+    if html_out is not None:
+        print(f"readable report: {html_out} (open it in a browser)")
+    for r in results:
+        print(f"  {r.verdict:13} {r.confidence:6} {r.advisory_id} {r.vulnerable_function}  {r.reason[:110]}")
+    print(f"OpenVEX statements: {len(vex['statements'])} (not_reachable only)")
+    return report, (2 if any(r.verdict == "reachable" for r in results) else 0)
+
+
+
+
+def _cmd_scan_all(sargs) -> int:
+    """`pyreach scan-all <project>`: check EVERY dependency, not one package.
+
+    1. Resolve dependencies to exact versions (deps.py — never guessed).
+    2. Per pinned package, get advisories: from --advisory-dir files when
+       given (offline, reproducible), else live via analyse_advisory_live
+       (OSV -> fix commit -> diff -> candidates, cached in .reachcache).
+       A fetch failure marks that package "fetch-failed" and the scan
+       continues with the rest — the failure stays visible in the report,
+       it is never a silent skip.
+    3. Run the same _run_scan as `scan` over the combined advisory list,
+       with the graph built once, and print a per-package table.
+    Exit 2 if any package has a reachable vulnerability, else 0.
+    """
+    root = Path(sargs.project)
+    if not root.exists():
+        print(f"error: project not found: {root}", file=sys.stderr)
+        return 1
+    dotenv_summary = load_dotenv_file(path=sargs.env_file, project=root)
+    _report_dotenv(dotenv_summary)
+    use_llm = should_use_llm(sargs.with_llm, sargs.no_llm, llm_key_present())
+    model, allow_fallback = resolve_model_choice(sargs.model)
+    if use_llm and not sargs.with_llm:
+        via = ".env" if any(k in dotenv_summary.get("loaded", [])
+                            for k in ("OPENROUTER_API_KEY", "GROQ_API_KEY")) else "the environment"
+        print(f"LLM: key found via {via}, resolver on (use --no-llm to skip it)")
+    elif sargs.with_llm and not llm_key_present():
+        print("LLM: --with-llm passed but no key found — put it in .env "
+              "(OPENROUTER_API_KEY=...) and re-run; staying uncertain for now")
+    cache = Cache(sargs.cache_dir)
+
+    deps, notes = resolve_dependencies(root, requirements=sargs.requirements,
+                                       include_dev=sargs.include_dev)
+    for n in notes:
+        print(f"scan-all: {n}")
+    only = {normalize_name(x) for x in (sargs.only.split(",") if sargs.only else []) if x.strip()}
+    skip = {normalize_name(x) for x in (sargs.skip.split(",") if sargs.skip else []) if x.strip()}
+    if only:
+        deps = [d for d in deps if d.key in only]
+    if skip:
+        deps = [d for d in deps if d.key not in skip]
+
+    packages: list[dict] = []
+    all_advisories = []
+    with tempfile.TemporaryDirectory(prefix="pyreach-scanall-") as tmp:
+        for i, dep in enumerate(deps, 1):
+            if dep.status == "skipped":
+                print(f"scan-all [{i}/{len(deps)}] {dep.name}: SKIP — {dep.reason}")
+                packages.append({"name": dep.name, "spec": dep.spec,
+                                 "version": None, "version_source": None,
+                                 "status": "skipped", "reason": dep.reason,
+                                 "advisories": 0, "candidates": 0})
+                continue
+            print(f"scan-all [{i}/{len(deps)}] {dep.name} {dep.version} "
+                  f"({dep.version_source}) ...")
+            entry: dict = {"name": dep.name, "spec": dep.spec,
+                           "version": dep.version,
+                           "version_source": dep.version_source,
+                           "advisories": 0, "candidates": 0}
+            try:
+                if sargs.advisory_dir:
+                    f = advisory_file_for(dep.name, sargs.advisory_dir)
+                    if f is None:
+                        entry.update(status="not-checked",
+                                     reason=f"no advisory file for {dep.name} in {sargs.advisory_dir} — "
+                                            "not checked, not assumed clean")
+                        packages.append(entry)
+                        continue
+                    advs = load_advisories(str(f))
+                else:
+                    print(f"  Phase 1: fetching advisories for {dep.name} {dep.version} ...")
+                    dicts = analyse_advisory_live(dep.name, dep.version, cache=cache)
+                    tmp_file = str(Path(tmp) / f"{dep.key}.json")
+                    save_advisories(dicts, tmp_file)
+                    advs = load_advisories(tmp_file)
+            except Exception as e:
+                entry.update(status="fetch-failed",
+                             reason=f"could not fetch advisories: {e}")
+                packages.append(entry)
+                print(f"  fetch failed for {dep.name}: {e} (continuing with the rest)")
+                continue
+            entry["status"] = "scanned" if advs else "no-advisories"
+            entry["advisories"] = len(advs)
+            entry["candidates"] = sum(len(a.vulnerable_functions) for a in advs)
+            print(f"  {dep.name}: {len(advs)} advisories, "
+                  f"{entry['candidates']} candidates")
+            all_advisories.extend(advs)
+            packages.append(entry)
+        if not all_advisories:
+            print("scan-all: no advisories for any dependency — nothing to "
+                  "check. The report still lists every package and skip, "
+                  "so 'nothing found' is checkable, not assumed.")
+        scan_args = argparse.Namespace(
+            out=sargs.out, vex=sargs.vex, with_proof=sargs.with_proof,
+            explain=sargs.explain, verbose=sargs.verbose,
+            no_html=sargs.no_html, llm_debug=sargs.llm_debug,
+            proof_timeout=sargs.proof_timeout, print_prompt=False)
+        report, code = _run_scan(root, all_advisories, cache, use_llm, model,
+                                 allow_fallback, scan_args, packages=packages)
+    print("\nscan-all packages:")
+    for pkg in report.get("packages", []):
+        res = pkg.get("results", {})
+        line = (f"  {pkg['name']} {pkg.get('version') or ''} "
+                f"({pkg.get('version_source') or pkg.get('status', '')}): "
+                f"{pkg.get('advisories', 0)} advisories")
+        if res:
+            line += (f" — {res.get('reachable', 0)} reachable, "
+                     f"{res.get('uncertain', 0)} uncertain, "
+                     f"{res.get('not_reachable', 0)} not_reachable")
+        if pkg.get("reason"):
+            line += f" — {pkg['reason']}"
+        print(line)
+    return code
 
 
 def main(argv=None) -> int:
@@ -304,6 +785,38 @@ def main(argv=None) -> int:
               + f" (model {used})")
         return 1
 
+    # Phase 7: pyreach scan-all <project> — every dependency, not one package.
+    if argv and argv[0] == "scan-all":
+        sp = argparse.ArgumentParser(
+            prog="pyreach scan-all",
+            description="Scan every dependency of a project for known vulnerabilities")
+        sp.add_argument("project", help="Path to the Python project to scan")
+        sp.add_argument("--out", default="report.json", help="JSON report output")
+        sp.add_argument("--vex", default="openvex.json", help="OpenVEX output (only for not_reachable)")
+        sp.add_argument("--requirements", default=None,
+                        help="requirements.txt to read pins from (default: <project>/requirements.txt)")
+        sp.add_argument("--advisory-dir", default=None,
+                        help="Directory of per-package advisory JSON files (<name>.json) — offline mode, no OSV fetch")
+        sp.add_argument("--include-dev", action="store_true",
+                        help="Also scan dev/test dependencies")
+        sp.add_argument("--only", default=None,
+                        help="Comma-separated dependency names to scan (default: all pinned)")
+        sp.add_argument("--skip", default=None,
+                        help="Comma-separated dependency names to skip")
+        sp.add_argument("--with-llm", action="store_true")
+        sp.add_argument("--no-llm", action="store_true")
+        sp.add_argument("--model", default=None)
+        sp.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
+        sp.add_argument("--explain", action="store_true")
+        sp.add_argument("--verbose", action="store_true")
+        sp.add_argument("--no-html", action="store_true")
+        sp.add_argument("--llm-debug", action="store_true")
+        sp.add_argument("--proof-timeout", type=int, default=10)
+        sp.add_argument("--cache-dir", default=".reachcache")
+        sp.add_argument("--env-file", default=None)
+        sargs = sp.parse_args(argv[1:])
+        return _cmd_scan_all(sargs)
+
     p = argparse.ArgumentParser(prog="pyreach", description="Which vuln alerts actually affect this Python project?")
     p.add_argument("command", choices=["scan"])
     p.add_argument("project", help="Path to the Python project to scan")
@@ -369,261 +882,8 @@ def main(argv=None) -> int:
     else:
         print("error: give --advisory <json> or --package <name> --version <ver>", file=sys.stderr)
         return 1
-    graph = build_graph(root)
-    entries, entry_note = find_entrypoints(root, graph)
-    # Quiet by default: the terminal is a summary, not a dump. A full
-    # entry-point list on a real project is 1,194 names on one line
-    # (MkDocs, 19 Nov 2026) — it belongs in report.json, not stdout.
-    if args.verbose:
-        print(f"entry points ({entry_note}): {sorted(entries)}")
-    else:
-        print(f"entry points ({entry_note}): {len(entries)}")
-    print(f"functions: {len(graph.functions)}, edges: {sum(len(v) for v in graph.edges.values())}, dynamic triggers: {len(graph.dynamic)}")
-
-    results = analyze(advisories, graph, entries)
-
-    # Completeness ledger — core, not a write-up item (ChatGPT fix)
-    ledger = Ledger(
-        project_files_discovered=len(list(root.rglob("*.py"))),
-        project_files_parsed=len({f.file for f in graph.functions.values() if f.file != "external"}),
-        dynamic_unresolved=len(graph.dynamic),
-        ambiguous_edges=sum(len(v) for v in graph.ambiguous.values()),
-        entry_points_identified=len(entries),
-        vulnerable_targets_high=sum(1 for a in advisories for f in a.vulnerable_functions if f.confidence == "high"),
-        vulnerable_targets_low=sum(1 for a in advisories for f in a.vulnerable_functions if f.confidence == "low"),
-    )
-    evidence = find_entrypoints_with_evidence(root, graph)
-    # Same rule: the whole evidence dict (1,194 entries on MkDocs) is
-    # in report.json as entry_evidence; the terminal gets a count.
-    if args.verbose:
-        print(f"entry evidence: {evidence}")
-    else:
-        print(f"entry evidence: {len(evidence)} entries (see report.json)")
-    print(f"completeness: {ledger.to_dict()}")
-
-    # Phase 4: deterministic constant propagation FIRST, LLM only for
-    # what it cannot resolve. Aggregation rule (19 Nov 2026 fix — the
-    # real PyYAML 5.3.1 sdist caught this): ONE dynamic site's answer
-    # decides ONE site, never the whole result. The old code took the
-    # first site that resolved to a literal list and let it decide:
-    # a single getattr with name "encoding" marked all 7 PyYAML
-    # candidates not_reachable, including yaml.load, which the test
-    # suite genuinely calls. Correct rule:
-    #   - any site resolving to the vulnerable name -> reachable
-    #   - ALL sites resolved safe, none unknown -> not_reachable
-    #   - otherwise -> stay uncertain, and say how many sites resolved
-    # --print-prompt shows the grounded prompt without calling any model,
-    # so the resolver is demoable with no API key at all.
-    for r in results:
-        if r.verdict != "uncertain" or not graph.dynamic:
-            continue
-        sites = graph.dynamic
-        resolved_safe = 0
-        unresolved = 0
-        llm_used = False
-        hit_reason = ""
-        hit_conf = "high"
-        for d in sites:
-            try:
-                src = Path(d["file"]).read_text(encoding="utf-8", errors="ignore")
-            except OSError:
-                unresolved += 1
-                continue
-            if args.print_prompt:
-                # Demo: first site only, not all 51 of them.
-                if d is sites[0]:
-                    lines = src.splitlines()
-                    lo, hi = max(0, d["line"] - 25), min(len(lines), d["line"] + 25)
-                    snippet = "\n".join(f"{i+1}: {lines[i]}" for i in range(lo, hi))
-                    same_file = sorted(q for q in graph.functions
-                                       if graph.functions[q].file == d["file"])
-                    from .resolver import extract_string_literals
-                    print(build_prompt(snippet, same_file, extract_string_literals(src),
-                                       [r.vulnerable_function], d["file"], d["line"]))
-                    print(f"# ... and {len(sites) - 1} more dynamic sites "
-                          f"(a key in .env enables the resolver for them all)")
-                continue
-            outcome = resolve_getattr_case(
-                src, d["line"], [r.vulnerable_function], set(graph.functions),
-                cache=cache, model=model, allow_llm=use_llm,
-                allow_fallback=allow_fallback)
-            if outcome is None:
-                unresolved += 1
-                continue
-            if outcome.get("_verification_failed"):
-                print(f"LLM resolver for {r.advisory_id}: {outcome['reason']}")
-                unresolved += 1
-                continue
-            if "LLM resolver" in outcome["reason"]:
-                llm_used = True
-            if outcome["verdict"] == "reachable":
-                hit_reason = outcome["reason"]
-                hit_conf = outcome["confidence"]
-                break
-            resolved_safe += 1
-        if hit_reason:
-            r.verdict, r.confidence = "reachable", hit_conf
-            r.reason += f" | {hit_reason}"
-            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: reachable — {hit_reason[:100]}")
-        elif unresolved == 0 and resolved_safe == len(sites):
-            # Every dynamic site resolved, none can hit the target.
-            conf = "medium" if llm_used else "high"
-            r.verdict, r.confidence = "not_reachable", conf
-            r.reason = (f"No static path. Phase 4 resolved all {len(sites)} "
-                        f"dynamic call site(s); none can reach {r.vulnerable_function}.")
-            print(f"Phase 4 {r.advisory_id} {r.vulnerable_function}: not_reachable "
-                  f"({conf}, all {len(sites)} dynamic sites resolved safe)")
-        else:
-            r.reason += (f" | Phase 4: resolved {resolved_safe}/{len(sites)} dynamic "
-                         f"sites safe, {unresolved} still unknown — staying uncertain")
-
-    # Phase 5: execution witness, reachable only. Never changes a verdict:
-    # a failed run keeps the static verdict. Entry functions are passed
-    # as dotted paths relative to their module (mod.Class.method works,
-    # <module> means import-only).
-    proofs = {}
-    if args.with_proof:
-        for r in results:
-            if r.verdict != "reachable" or not r.path:
-                continue
-            entry_q = r.path[0]
-            if entry_q not in graph.functions:
-                continue
-            entry_file = str(Path(graph.functions[entry_q].file).resolve())
-            # Strip the module prefix: app.Loader.load_config -> Loader.load_config
-            mod = entry_q.rsplit(".", 1)[0] if "." in entry_q else ""
-            entry_func = entry_q[len(mod) + 1:] if mod and entry_q.startswith(mod + ".") else entry_q.split(".")[-1]
-            proof = run_execution_proof(str(root), entry_file, entry_func,
-                                        r.vulnerable_function, timeout=args.proof_timeout)
-            proofs[r.advisory_id] = proof
-            print(f"proof {r.advisory_id}: vulnerable_hit={proof['vulnerable_hit']} trace={proof['trace'][:5]} error={proof['error']}")
-
-    # Ledger is stale after Phase 4 resolution: a dynamic case resolved
-    # by constant propagation / verified LLM is no longer unresolved.
-    ledger.dynamic_unresolved = sum(1 for r in results if r.verdict == "uncertain")
-    ledger.ambiguous_edges = sum(len(v) for v in graph.ambiguous.values())
-    total = len(results) or 1
-    uncertain_rate = sum(1 for r in results if r.verdict == "uncertain") / total
-    print(f"uncertain rate: {uncertain_rate:.0%} ({sum(1 for r in results if r.verdict == 'uncertain')}/{len(results)}) — a tool that labels everything uncertain gets 0 false not-reachable without solving anything, so report this metric.")
-
-    # Explainer: deterministic first, LLM layer only if enabled. Runs
-    # AFTER Phase 4 resolution, so explanations describe final verdicts.
-    # Never changes a verdict; the LLM output is verified before display.
-    explanations = []
-    if args.explain:
-        uncertain_results = [r for r in results if r.verdict == "uncertain"]
-        if not uncertain_results:
-            print("explain: no uncertain results to explain.")
-        for r in uncertain_results:
-            adv = next((a for a in advisories if a.id == r.advisory_id), None)
-            exp = explain_result(
-                r, graph, root,
-                {"id": r.advisory_id, "package": r.package,
-                 "fixed_version": adv.fixed_version if adv else ""},
-                entries, use_llm=use_llm, model=model, cache=cache,
-                allow_fallback=allow_fallback)
-            explanations.append({
-                "vulnerable_function": exp["vulnerable_function"],
-                "advisory_id": exp["advisory_id"],
-                "blocker": exp["blocker"],
-                "deterministic_explanation": exp["deterministic_explanation"],
-                "llm_explanation": exp["llm_explanation"],
-                "llm_rejected": exp["llm_rejected"],
-                # The diagnostic: what the LLM layer actually did for
-                # this result (ok / rejected / no_key / timeout /
-                # rate_limited / ... / not_called). llm_enabled only
-                # proves a key was found, never that a call succeeded.
-                "llm_status": exp.get("llm_status", "not_called"),
-                "llm_error": exp.get("llm_error"),
-                # Which model produced (or was last tried for) this
-                # explanation — not always the default, when the
-                # fallback chain switched models on a delisted 404.
-                "llm_model": exp.get("llm_model"),
-                "discriminating_check": exp["discriminating_check"],
-                "does_not_know": exp["does_not_know"],
-                "evidence_pack_tokens": exp["evidence_pack_tokens"],
-            })
-            # Quiet by default: ONE line per uncertain result. The full
-            # explanation text (deterministic + LLM layer) is in
-            # report.json and in the HTML report — printing it all made
-            # a MkDocs scan ~240KB of terminal output. --verbose
-            # restores the old full dump for debugging.
-            if args.verbose:
-                print()
-                print(format_explanation(exp))
-            else:
-                loc = blocked_location(exp["deterministic_explanation"])
-                print(f"explain [uncertain] {exp['vulnerable_function']} — "
-                      f"blocker {exp['blocker']}"
-                      + (f", blocked at {loc}" if loc else "")
-                      + f" (full explanation in {html_path_for(args.out).name})")
-        # One line saying what the LLM layer actually did. Before this
-        # fix, llm_explanation null + llm_rejected false looked like
-        # "rejected" or "not tried" — it was neither: the call itself
-        # had failed silently (no key / timeout / 429 / bad JSON).
-        if explanations:
-            print(llm_explainer_summary(explanations))
-            if args.llm_debug:
-                _print_llm_debug(explanations)
-    html_name = None if args.no_html else html_path_for(args.out).name
-    report = {
-        "project": str(root),
-        "html_report": html_name,
-        # Phase 3: provenance — which advisory, which fix commit, how many
-        # candidates, so a judge can reproduce the run from the report alone.
-        "advisories": [
-            {"id": a.id, "package": a.package, "fixed_version": a.fixed_version,
-             "fix_commit": a.fix_commit if isinstance(a.fix_commit, str) else "",
-             "candidates": len(a.vulnerable_functions)}
-            for a in advisories
-        ],
-        "entry_note": entry_note,
-        "entry_evidence": evidence,
-        "llm_enabled": use_llm,
-        "completeness_ledger": ledger.to_dict(),
-        "uncertain_rate": uncertain_rate,
-        "cache": {"hits": cache.hits, "misses": cache.misses},
-        "results": [
-            {"advisory_id": r.advisory_id, "package": r.package,
-             "vulnerable_function": r.vulnerable_function, "verdict": r.verdict,
-             "confidence": r.confidence, "path": r.path, "reason": r.reason}
-            for r in results
-        ],
-        "proofs": proofs,
-        "explanations": explanations,
-        "pr_comments": [format_pr_comment(r, entry_note) for r in results],
-    }
-    Path(args.out).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    # Readable HTML interface, written next to the JSON report unless
-    # --no-html was given. It renders report.json data only, so it can
-    # be regenerated later with `pyreach report --report <report.json>`.
-    html_out = None
-    if not args.no_html:
-        html_out = write_html_report(report, args.out)
-    # OpenVEX, per result, not per run (Phase 1 fix).
-    # The old rule blocked ALL VEX if any result was uncertain — one
-    # uncertain library-internal candidate (e.g. construct_python_object_new,
-    # dependency not parsed) then blocked VEX for yaml.full_load, which IS
-    # provably not_reachable from project source alone. That was wrong.
-    # Correct gate, per result: the verdict itself is not_reachable with
-    # high/medium confidence, AND the graph is clean (no dynamic trigger,
-    # no ambiguous edge, project fully parsed), so no hidden path could
-    # exist for that target. Uncertain results never produce VEX.
-    graph_clean = (not graph.dynamic and not graph.ambiguous
-                   and ledger.project_files_discovered == ledger.project_files_parsed)
-    vex_results = [
-        r for r in results
-        if r.verdict == "not_reachable" and r.confidence in ("high", "medium")
-    ] if graph_clean else []
-    vex = build_openvex(vex_results, root.name)
-    write_openvex(args.vex, vex)
-    print(f"\nwrote {args.out} and {args.vex}")
-    if html_out is not None:
-        print(f"readable report: {html_out} (open it in a browser)")
-    for r in results:
-        print(f"  {r.verdict:13} {r.confidence:6} {r.advisory_id} {r.vulnerable_function}  {r.reason[:110]}")
-    print(f"OpenVEX statements: {len(vex['statements'])} (not_reachable only)")
-    return 2 if any(r.verdict == "reachable" for r in results) else 0
+    return _run_scan(root, advisories, cache, use_llm, model,
+                     allow_fallback, args)[1]
 
 
 if __name__ == "__main__":

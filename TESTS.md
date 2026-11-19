@@ -1,9 +1,9 @@
-# Tests to perform — pyreach, Phases 1–5
+# Tests to perform — pyreach, Phases 1–8
 
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 93 unit tests + 26 fixture scans + prompt + witness + explain + quiet/HTML
+python verify.py            # offline: 173 unit tests + 32 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,11 +39,11 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 120 tests run with stdlib unittest:
+# if pytest is not installed, the same 173 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 
-Expect: **120 passed**. These cover the call graph, the verifier's 10 rules,
+Expect: **173 passed**. These cover the call graph, the verifier's 10 rules,
 constant propagation, the witness, the debate rule, and the explainer
 (21 tests: citation verifier, evidence-pack caps, all four blocker
 templates, LLM unavailable / rejected / accepted / not-called), plus 8 tests for
@@ -91,6 +91,13 @@ Exit code is part of the contract: **2 = reachable, 0 = not_reachable / uncertai
 | app_witness_wrapper | reachable, exit 2 | wrapper path, witness keeps the middle |
 | app_proof_args | reachable, exit 2 | entry needs args: witness misses, verdict stays |
 | app_getattr_mixed | **uncertain**, exit 0 | two dynamic sites: one safe literal, one config — one safe site must NOT clear the result |
+| app_load_collision | reachable, exit 2 | dotted `yaml.load` beats a same-named test fake |
+| app_unresolved_attr | **uncertain**, exit 0 | `parser.load()` where parser's type is unknown — must never be not_reachable (Phase 8) |
+| app_never_imported | not_reachable, exit 0 | never-imported module's top-level call is dead code (Phase 8) |
+| app_vex_full | reachable, exit 2 | yaml.load reachable — no VEX statement for its advisory (Phase 8) |
+| app_unparsed | **uncertain**, exit 0 | 1/2 files parsed — completeness gate flips not_reachable (Phase 8) |
+| app_mockpatch | not_reachable, exit 0 | `@mock.patch` is not a route, no phantom entry (Phase 8) |
+| app_dunder | **uncertain**, exit 0 | getattr inside `__getattr__` runs at runtime though nothing calls it by name (Phase 8) |
 
 ### 3. Phase 4 — the resolver, no key needed
 
@@ -259,6 +266,59 @@ bigger repo and read `report.json` — especially the completeness ledger
 and the uncertain rate. On a big repo, skip `--with-proof` at first: the
 witness runs one subprocess per reachable result.
 
+## Test scan-all — the whole project (Phase 7, 19 Nov 2026)
+
+Offline, deterministic, no network — advisory files stand in for OSV:
+
+```bash
+python -m pyreach.cli scan-all fixtures/app_scanall --advisory-dir fixtures/app_scanall_advisories --no-llm --out report.json
+# expect exit 2. report.json "packages":
+#   PyYAML 5.3.1 (pyproject): 1 advisory — 1 reachable (yaml.load)
+#   requests 2.31.0: not-checked — no advisory file in the dir, NOT assumed clean
+#   pyreach-skip-demo: skipped — range-only (>=1.0), no exact version anywhere
+python -m pyreach.cli scan-all fixtures/app_scanall --advisory-dir fixtures/app_scanall_advisories --only pyyaml --no-llm --out report.json
+# expect exit 2, packages == [PyYAML] only
+```
+
+Live, on a real repo (needs network). Pin the version you want checked —
+a bare `pyproject.toml` range is not a version, and a range-only dep is
+skipped, not guessed:
+
+```bash
+git clone --depth 1 https://github.com/mkdocs/mkdocs.git
+printf 'PyYAML==5.3.1\n' > /tmp/demo-reqs.txt
+python -m pyreach.cli scan-all mkdocs --requirements /tmp/demo-reqs.txt --no-llm --out report.json
+# expect exit 2: PyYAML 5.3.1 (requirements) 1 advisory, 4 reachable / 3 uncertain —
+# identical verdicts to the single-package scan — plus packaging from the
+# installed environment (0 advisories) and 12 range-only deps skipped, listed.
+```
+
+`verify.py` section I runs the offline check; `tests/test_deps.py`
+covers resolution (pin priority, lockfiles, installed fallback, skip),
+`tests/test_scanall.py` covers the offline/live-stubbed/fetch-failed
+paths and `--only`. Phase 8 (19 Nov 2026): lockfile-only packages are
+added as pinned transitive entries, and direct-URL / editable
+requirements are recorded as SKIPPED with a reason instead of being
+silently dropped (same for poetry git/path/url deps) —
+`tests/test_phase8.py::TestDepsPhase8`.
+
+## Test Phase 8 — the three invariants (19 Nov 2026)
+
+The ChatGPT review fixes, all in `tests/test_phase8.py` (24 tests)
+and `verify.py` section J:
+
+```bash
+python -m pyreach.cli scan fixtures/app_unresolved_attr --advisory examples/advisory-sample.json --no-llm
+# expect uncertain, exit 0, 0 VEX: parser.load() may call yaml.load
+python -m pyreach.cli scan fixtures/app_vex_full --advisory examples/advisory-real-pyyaml.json --no-llm
+# expect exit 2, 0 VEX statements: yaml.load reachable blocks not_affected
+# for the whole advisory even though full_load and yaml.full_load are not_reachable
+python -m pyreach.cli scan fixtures/app_safe --advisory examples/advisory-sample.json --no-llm
+# expect not_reachable, exit 0, exactly 1 VEX statement
+python -m pyreach.cli scan fixtures/app_dunder --advisory examples/advisory-sample.json --no-llm
+# expect uncertain, exit 0: the getattr inside __getattr__ runs at runtime
+```
+
 ## The LLM — do you need it, and where the key goes
 
 **No, not for the core workflow.** Phases 1, 2, 3 and 5 run with no LLM
@@ -362,6 +422,17 @@ call succeeded. `llm_status` is the proof. Kinds and what to do:
 | `bad_json` | Model replied, but not the expected JSON | Retry — free-tier models sometimes answer in prose |
 | `network_error` | Endpoint unreachable | Check network / `LLM_BASE_URL` |
 | `not_called` | Layer never ran (`--no-llm`) | Expected — deterministic only |
+
+If `llm_error` names a local file instead of the network — e.g.
+`OSError: [Errno 22] Invalid argument: '.reachcache\llm:...json'` —
+that was a cache bug, not the API: `:` is illegal in a Windows
+filename and the LLM cache key contains it. Fixed 19 Nov 2026
+(`cache.py` sanitises every Windows-illegal character; a cache
+failure can no longer be reported as `network_error`). The failure
+happened when *saving* the model's answer, after a successful POST,
+so the key, model and endpoint were fine. `llm-test` never touches
+the cache (`cache=None`), which is why it is the right first check:
+if it says ok, a scan failure is local.
 
 A scan with `--explain` prints one summary line after the
 explanations, e.g. `LLM explainer: 3 called, 0 accepted, 0 rejected,

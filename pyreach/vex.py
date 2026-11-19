@@ -12,24 +12,43 @@ from datetime import datetime, timezone
 from .reach import Result
 
 
-def build_openvex(results: list[Result], project: str, author: str = "pyreach") -> dict:
-    statements = []
+def build_openvex(results: list[Result], project: str, graph_clean: bool = True,
+                  author: str = "pyreach") -> dict:
+    """OpenVEX output, aggregated at the advisory level (ChatGPT Critical
+    2, 19 Nov 2026): a not_affected statement is about a vulnerability +
+    product, not about one candidate function. It is emitted for an
+    advisory ONLY when EVERY candidate for that advisory is not_reachable
+    with high/medium confidence AND the graph is clean (ledger complete
+    for not_reachable). One statement per advisory, with a combined note.
+    If even one candidate is reachable or uncertain, no statement is
+    emitted for that advisory at all — emitting not_affected next to a
+    reachable finding in the same report contradicted the tool's own
+    results. Uncertain results never produce VEX."""
+    by_adv: dict[str, list[Result]] = {}
     for r in results:
-        if r.verdict != "not_reachable":
+        by_adv.setdefault(r.advisory_id, []).append(r)
+    statements = []
+    for adv_id, rs in by_adv.items():
+        if not graph_clean:
             continue
+        if not all(r.verdict == "not_reachable"
+                   and r.confidence in ("high", "medium") for r in rs):
+            continue
+        pkg = rs[0].package
+        notes = "; ".join(f"{r.vulnerable_function}: {r.reason}" for r in rs)
         statements.append({
-            "vulnerability": {"@id": r.advisory_id, "name": r.advisory_id},
+            "vulnerability": {"@id": adv_id, "name": adv_id},
             "products": [{
                 "@id": project,
                 "identifiers": {"purl": f"pkg:generic/{project}"},
                 # Vulnerable dependency as a subcomponent (ChatGPT fix)
                 "subcomponents": [{
-                    "@id": r.package,
-                    "identifiers": {"purl": f"pkg:pypi/{r.package}"},
-                }] if r.package else [],
+                    "@id": pkg,
+                    "identifiers": {"purl": f"pkg:pypi/{pkg}"},
+                }] if pkg else [],
             }],
             "status": "not_affected",
-            "status_notes": r.reason,
+            "status_notes": notes,
             "justification": "vulnerable_code_not_in_execute_path",
         })
     return {

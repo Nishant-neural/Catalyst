@@ -29,6 +29,12 @@ pyreach scan fixtures/app_vuln --advisory examples/advisory-sample.json --with-p
 pyreach scan fixtures/app_getattr_config --advisory examples/advisory-sample.json --explain --no-llm --out report.json
 pyreach explain --report report.json --project fixtures/app_getattr_config --no-llm
 
+# Phase 7, full package scanner — every dependency, not one --package:
+pyreach scan-all fixtures/app_scanall --advisory-dir fixtures/app_scanall_advisories --no-llm --out report.json
+# Live (needs network): reads deps from pyproject.toml / requirements.txt
+# / lockfiles, resolves each to an exact version, fetches OSV per package:
+pyreach scan-all <project> --no-llm --out report.json
+
 python -m pytest tests/ -q
 ```
 
@@ -54,6 +60,35 @@ python -m pytest tests/ -q
    verbatim, or the answer is rejected and only the deterministic
    explanation is shown. Lines are labelled `[deterministic]` vs
    `[llm-explainer]`; no key means deterministic only.
+7. **Full package scanner** (`scan-all`): reads the project's real
+   dependencies from `pyproject.toml` / `requirements.txt` / lockfiles
+   (`poetry.lock`, `Pipfile.lock`, `uv.lock`), resolves each one to an
+   EXACT version (requirements `==` pin, then pyproject `==` pin, then
+   lockfile, then the installed environment), fetches OSV advisories
+   per package, and runs the same reachability check over the combined
+   list with the call graph built once. A dependency with no exact
+   version anywhere is SKIPPED and listed with its spec and where a
+   pin would come from — never scanned against a guessed version,
+   never silently dropped. A fetch failure marks that package
+   `fetch-failed` and the scan continues. The report gains a
+   `packages` table (per-package advisories, candidates, verdict
+   counts, status) and a per-package terminal table; exit 2 if any
+   package has a reachable vulnerability. `--advisory-dir` runs it
+   fully offline from per-package advisory files (`<name>.json`).
+   Lockfile-only (transitive) packages are scanned too; direct-URL
+   and editable requirements are recorded SKIPPED, not dropped.
+8. **Three invariants (Phase 8, 19 Nov 2026):** a reachable
+   vulnerability always produces a real inspectable call path; an
+   incomplete/unresolved path never becomes NOT_REACHABLE (unresolved
+   attribute calls, referenced-but-not-called names, library-internal
+   functions with unparsed dependency source, and the completeness
+   gate for unparsed files / unresolved imports / unsupported entry
+   points all force uncertain); OpenVEX is aggregated at the advisory
+   level — one `not_affected` statement only when EVERY candidate for
+   that advisory is not_reachable, so it can never contradict a
+   reachable finding in the same report. Entry points count only
+   modules that can actually execute (no blanket `main`, no
+   never-imported module, no `@mock.patch` phantom).
 
 ## Reading a scan — terminal is a summary, the HTML report is the interface
 
@@ -70,7 +105,7 @@ terminal dump for debugging, `--no-html` skips the HTML file, and
 `pyreach report --report report.json` regenerates the HTML from an
 existing report without re-scanning.
 
-See `PHASES.md` for implementation details for Phases 1-5 and the
+See `PHASES.md` for implementation details for Phases 1–8 and the
 explainer, the design question answers, the 24-hour timeline, and the
 demo script.
 

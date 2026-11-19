@@ -97,11 +97,12 @@ Vulnerable functions for this advisory:
 Rules:
 - Trace where the name / module string comes from. Literal? Loop over literals? Config / user input / env?
 - If the value is a literal or a loop over literals, list the exact possible values.
+- If you answer can_reach false, possible_values MUST list every value the name can take — an empty list is not an answer.
 - If the value comes from config, user input, env, or an unknown source, answer can_reach: "unknown".
 - Cite line numbers that actually exist in the code above.
 
 Return strict JSON only:
-{{"can_reach": true|false|"unknown", "possible_values": ["..."], "vulnerable_hit": "qualified.name or null", "reason": "one sentence", "evidence_lines": [12, 13], "confidence": 0.0}}
+{{"can_reach": true|false|"unknown", "possible_values": ["..."], "vulnerable_hit": "qualified.name or null", "reason": "one sentence", "evidence_lines": [12, 13], "confidence": 0.9}}
 Temperature 0. No extra text.
 """
 
@@ -311,7 +312,13 @@ def _cached_answer(prompt: str, model: str, cache):
     """Cached answer for one model, or None. No network, no key needed."""
     if cache is None:
         return None
-    hit = cache.get(_cache_key(prompt, model))
+    try:
+        hit = cache.get(_cache_key(prompt, model))
+    except Exception:
+        # A cache failure is a miss, never a call failure: on 19 Nov 2026
+        # a Windows-illegal ":" in the cache filename raised OSError here
+        # and the caller reported it as a network error.
+        return None
     return hit.get("answer") if hit is not None else None
 
 
@@ -366,14 +373,26 @@ def _attempt_llm_call(prompt: str, model: str, key: str, cache=None,
                                     f"({_safe_detail(str(e))})",
                           "model": model}, False
         if cache is not None and cache_key is not None:
-            cache.put(cache_key, {"answer": ans})
+            try:
+                cache.put(cache_key, {"answer": ans})
+            except Exception:
+                # Best-effort: a cache write must never turn a good
+                # answer into a failure. (Before this fix the put sat
+                # inside the network try below, so a Windows OSError
+                # from the ":" in the cache filename was reported as
+                # "network_error" — the 19 Nov 2026 MkDocs run.)
+                pass
         return ans, {"kind": "ok", "detail": "", "model": model}, False
     except Exception as e:
         # Classify by exception type/name, not by message text: the
         # requests classes may be absent, and a message could in
         # principle echo a header. Order matters: HTTPError is also a
         # RequestException, and Timeout must be checked before the
-        # generic network bucket.
+        # generic network bucket. Anything that is not a requests error
+        # (e.g. an OSError from local code) is reported as-is under
+        # network_error only as a last resort — cache errors are kept
+        # out of this block by the try/except around cache.put above
+        # and around cache.get in _cached_answer.
         name = type(e).__name__
         status_code = getattr(getattr(e, "response", None), "status_code", None)
         if name == "Timeout" or "Timeout" in name:

@@ -29,6 +29,11 @@ class Ledger:
     entry_points_unsupported: list[str] = field(default_factory=list)
     dynamic_unresolved: int = 0
     ambiguous_edges: int = 0
+    # Unresolved attribute calls (parser.load() on an unknown type).
+    # Recorded for the report; the per-target gate lives in reach.py
+    # (only a site whose attribute name matches the target blocks it),
+    # so this count is NOT part of is_complete_for_not_reachable().
+    unresolved_attribute_calls: int = 0
     vulnerable_targets_high: int = 0
     vulnerable_targets_low: int = 0
 
@@ -50,6 +55,7 @@ class Ledger:
             "entry_points_unsupported": self.entry_points_unsupported,
             "dynamic_unresolved": self.dynamic_unresolved,
             "ambiguous_edges": self.ambiguous_edges,
+            "unresolved_attribute_calls": self.unresolved_attribute_calls,
             "vulnerable_targets_high": self.vulnerable_targets_high,
             "vulnerable_targets_low": self.vulnerable_targets_low,
             "complete_for_not_reachable": self.is_complete_for_not_reachable(),

@@ -843,6 +843,188 @@ keep core + LLM resolver. Never cut the verifier or the fail-closed rule.
    End with the scoreboard: fixtures passed, false not_reachable 0,
    cache hits.
 
+## Phase 7 — Full package scanner (`scan-all`) ✅ BUILT (19 Nov 2026)
+
+Until now `scan` only checked the one package given with
+`--package/--version`. A judge scanning a real project wants the whole
+dependency list checked. `scan-all` does that, in three steps:
+
+1. **Resolve dependencies** (`pyreach/deps.py`, stdlib only): read
+   `pyproject.toml` (`[project]` dependencies, poetry dependencies,
+   dev groups only with `--include-dev`), `requirements.txt` (+ files
+   under `requirements/`, `-r` includes followed), and lockfiles
+   (`poetry.lock`, `Pipfile.lock`, `uv.lock`). Exact version priority:
+   requirements `==` pin, then pyproject `==` pin, then lockfile, then
+   the installed environment (`importlib.metadata`). A dependency with
+   no exact version anywhere is SKIPPED, listed in the report with its
+   spec and where a pin would come from — never scanned against a
+   guessed version, never silently dropped.
+2. **Per package, get advisories**: live via `analyse_advisory_live`
+   (OSV → fix commit → diff → candidates, cached in `.reachcache`),
+   or offline from `--advisory-dir` (`<normalized-name>.json` per
+   package — reproducible, and what `verify.py` section I uses). A
+   fetch failure marks that package `fetch-failed` and the scan
+   continues with the rest; the failure stays visible in the report.
+3. **One combined run**: the same `_run_scan` as `scan` over all
+   advisories, the call graph built once. The report gains `mode:
+   "scan-all"` and a `packages` table (name, version, version_source,
+   advisories, candidates, per-verdict counts, status, reason);
+   OpenVEX, HTML and `--explain` all work over the aggregated results.
+   Exit 2 if any package has a reachable vulnerability, else 0.
+   `--only` / `--skip` limit the packages; `--with-proof` and
+   `--explain` behave as in `scan`.
+
+Live proof (19 Nov 2026, this VM, real MkDocs clone, PyYAML pinned
+`==5.3.1` via a requirements file): 14 dependencies, 2 scanned
+(PyYAML 5.3.1 → 1 advisory, 7 candidates, 4 reachable / 3 uncertain —
+identical verdicts to the single-package scan; packaging 24.0 →
+0 advisories), 12 skipped as range-only with the reason printed.
+`verify.py` section I checks the offline path on
+`fixtures/app_scanall`.
+
+### Windows cache bug, found by scan-all's prerequisite run (19 Nov 2026)
+
+The MkDocs LLM run before this phase (`mkdocs-llm-2.json`, re-uploaded
+as `mkdocs-llm-3.json` — the two files are identical in every field
+that matters) showed all 3 explanations `network_error` with
+`OSError: [Errno 22] Invalid argument:
+'.reachcache\llm:cohere_north-mini-code:free:<hash>.json'`. That is
+NOT a network failure: `:` is illegal in a Windows filename, and the
+LLM cache key is `llm:<model>:<sha16>`. `Cache._path` only sanitised
+`/` and `@`; Linux allows `:` so the VM's tests never caught it. The
+failure happens when SAVING the model's answer, after a successful
+POST — so the key, the model and OpenRouter were most likely fine all
+along and the answer was thrown away at the cache write. Fixed in
+`cache.py` (all Windows-illegal filename characters become `_`,
+get/put are best-effort and never raise into the caller) and in
+`resolver.py` (the cache write sits in its own try/except, and a cache
+failure can no longer be classified as `network_error`). Tests:
+`tests/test_cache.py` pins the filename rule and proves a failing
+cache still returns the model's answer with kind `ok`. Note
+`llm-test` never hit this bug — it uses `cache=None` — which is why
+it is the right first diagnostic: if `llm-test` says ok, the endpoint,
+key and model work and a scan failure is local.
+
+## Phase 8 — ChatGPT review fixes: the three invariants ✅ BUILT (19 Nov 2026)
+
+A ChatGPT rating of the project (5/10 core verdict reliability) was
+verified against the code, not taken on trust. Both critical findings
+reproduced exactly as described, plus four more. The build stops
+adding features and makes three invariants demonstrably correct:
+
+1. a reachable vulnerability always produces a real inspectable call path;
+2. an incomplete/unresolved path never becomes NOT_REACHABLE;
+3. OpenVEX never claims not affected when another finding says the
+   same vulnerability is reachable.
+
+**Critical 1 — an unresolved call became NOT_REACHABLE.** `parser =
+get_parser(); parser.load(...)` was dropped silently (callgraph.py:
+"attr-unresolved ... drop") and the app got `not_reachable high` + an
+OpenVEX `not_affected` statement, while really calling yaml.load.
+Fixed: attr-unresolved calls are recorded in
+`graph.unresolved_attrs` ({file, line, caller, attr}); a site whose
+attribute equals the candidate's simple name makes that candidate
+uncertain, with the reason naming the exact site. Fixture
+`app_unresolved_attr`, expected uncertain, 0 VEX.
+
+**Critical 2 — OpenVEX contradicted reachability.** `build_openvex`
+emitted a `not_affected` statement per not_reachable result, so an app
+calling `yaml.load(..., Loader=yaml.FullLoader)` got three
+`not_affected` statements for the same GHSA while the same report said
+yaml.load was reachable. Fixed: aggregation at the advisory level —
+one statement per advisory, only when EVERY candidate for it is
+not_reachable with high/medium confidence, gated on the ledger
+(`is_complete_for_not_reachable()`). The old per-result
+`graph_clean` gate in cli.py is replaced by that call. Fixture
+`app_vex_full` (real advisory): yaml.load + 3 internals reachable,
+FullLoader uncertain, 2 not_reachable, **0 VEX statements**;
+`verify.py` section J pins this, plus the all-clear cases
+(app_safe, app_never_imported → exactly 1 statement each).
+
+**Critical 3 — dependency source never parsed.** The `construct_`
+heuristic was a PyYAML special case. Replaced by a general public-API
+rule (`reach._is_library_internal`): a candidate is library-internal
+iff it is not a project function AND has a dot AND its first segment
+is not a module the project imports; bare names are public. Internal
++ dependency unparsed → uncertain, never not_reachable. The ledger now
+reports dependency coverage honestly (`dependency_modules_discovered`
+via `importlib.util.find_spec`, parsed stays 0 — the dependency source
+is still not parsed; the rule makes the absence explicit instead of
+guessing). The related FullLoader case is a **reference rule**: a
+candidate referenced without being called (`Loader=yaml.FullLoader`,
+`functools.partial(yaml.load, ...)` in pre-commit) → uncertain.
+
+**Critical 4 — entry points over-broad.** Every function named `main`
+was an entry, and every `<module>` with edges was one, so a
+never-imported module's top-level `yaml.load()` counted as reachable.
+Fixed: program modules are file stems {main, app, cli, __main__} or
+modules with a `__main__` guard or console-script targets or the
+project's only module or (library mode) `__init__`; `<module>` entries
+only for program modules ∪ modules they transitively import (over
+`graph.file_imports`). The blanket `main` rule is deleted. The
+`@mock.patch` phantom is fixed too (`_is_route_decorator` rejects
+`mock.patch`): MkDocs entries fell 1,217 → 1,092. Fixtures
+`app_never_imported` (not_reachable, 1 VEX) and `app_mockpatch`.
+
+**Critical 5 — the completeness ledger was never consulted.**
+`is_complete_for_not_reachable()`, `unresolved_imports` and
+`entry_points_unsupported` had zero callers/writers outside
+completeness.py. Fixed: the ledger is now populated in `_run_scan`
+(unresolved imports from the import analysis, unsupported entry
+points — class-based Django views and unresolvable console-script
+targets — from `find_unsupported_entrypoints`, dependency coverage,
+`unresolved_attribute_calls`), `dynamic_unresolved` now means what
+it says (dynamic sites still unknown after Phase 4, not a count of
+uncertain results), and a **verdict gate** flips not_reachable →
+uncertain/low when files are unparsed or imports/entry points are
+unresolved. Dynamic/ambiguous stay per-target (analyze + Phase 4
+already handle them); VEX uses the stricter whole-run ledger.
+Fixture `app_unparsed` (1/2 parsed → gate flips to uncertain).
+
+**Critical 6 — phase1 mapping bugs.** `diff_files` kept the `b/`
+prefix from `+++ b/...` headers and `fetch_github_file` never
+stripped it, so changed-file fetches 404'd; `old_sources` was
+initialised `{}` and never filled, so the both-sides mapping in
+`diff_to_functions` never ran. Fixed: `b/` (and `a/`) stripped at
+extraction and in `fetch_github_file`; new `fetch_github_parent_sha`
+(GitHub API, cached, best-effort) fetches each changed file at the
+parent commit into `old_sources`. File fetches are wrapped so a
+missing `requests` install (diff came from cache) cannot crash the
+live fetch. Tests mock the fetch functions and pin both behaviours.
+
+**Target-specific dynamic/ambiguous blocking (was: global).** Any
+reachable dynamic trigger or ambiguous edge anywhere used to block
+not_reachable for every unrelated candidate. Now only edges/sites
+that can reach the target block it, decided by `site_can_run`:
+caller BFS-reachable, or module top-level code of a reachable module,
+or an implicitly-invoked dunder method of a reachable module.
+The dunder case was found by the MkDocs re-run in this same phase:
+the BFS-only filter dropped the `config_options.py:549` getattr
+inside `Optional.__getattr__`, so Phase 4 claimed "all 5 sites
+resolved" while 2 real sites were never examined. With the fix
+MkDocs tries 10 sites, resolves 8, 2 still unknown — the honest
+story from before the phase, with exact counts. Fixture `app_dunder`
+pins the dunder rule. Phase 4 tries only sites that can run, by the
+same predicate.
+
+**Scan-all (§4):** lockfile-only packages are now added as pinned
+transitive entries (version_source "lockfile"); direct-URL and
+editable requirements produce SKIPPED entries with a reason instead
+of being silently dropped (same for poetry git/path/url deps).
+The witness prints a not-a-sandbox warning when `--with-proof` runs.
+
+Re-runs 19 Nov 2026 (fresh clones, same commits as the Phase 7
+verification: MkDocs 2862536, Cookiecutter c88fbe9, pre-commit
+ba5c420): verdict splits unchanged — MkDocs 4 reachable / 3
+uncertain, Cookiecutter 7/7 uncertain, pre-commit 7/7 uncertain —
+with better reasons and an honest ledger. MkDocs: entries 1,092,
+dynamic_unresolved 2, ambiguous 1,980, unparsed 11/65. Cookiecutter:
+entries 456, gate blocks 4 candidates on 13 unparsed files.
+Pre-commit: entries 33, yaml.load uncertain via the reference rule
+(the `functools.partial` wrapper). Full numbers in REAL_PROJECTS.md.
+`verify.py` offline: **47 passed, 0 failed** (was 38); unit suite
+**173 tests** (was 149); 32 fixtures.
+
 ## Risks and trade-offs
 
 - Fix commit may be a big refactor: confidence drops, verdict becomes
@@ -859,5 +1041,8 @@ keep core + LLM resolver. Never cut the verifier or the fail-closed rule.
 ## Tech stack
 
 Python 3.11+, stdlib `ast`, `pathlib`, `json`, `requests` for OSV/GitHub.
-Small open-weight model only, gpt-oss 20B or Llama 3.1 8B, via a free
-provider, temp 0. No paid LLM, no GPU, CPU laptop is enough.
+Small open-weight model only, temp 0 — current default
+`cohere/north-mini-code:free` with a free-model fallback chain
+(`resolver.py`: `FREE_MODEL_FALLBACKS`); free slugs get delisted, so
+re-check the live OpenRouter catalog before pinning a new default.
+No paid LLM, no GPU, CPU laptop is enough.

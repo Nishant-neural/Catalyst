@@ -37,16 +37,38 @@ class Cache:
         self.misses = 0
 
     def _path(self, key: str) -> Path:
-        safe = key.replace("/", "_").replace("@", "_at_")
+        # Windows fix (19 Nov 2026, found from Nishant's mkdocs-llm-2.json):
+        # the LLM cache key is "llm:<model>:<sha16>", and the model slug
+        # contains ":" (cohere/north-mini-code:free). ":" is illegal in a
+        # Windows filename, so every LLM cache get/put on his machine
+        # raised OSError Errno 22 — and the resolver's generic except
+        # then mislabelled that local error as "network_error", so the
+        # LLM looked dead-network when it had never even been reached.
+        # Only "/" and "@" were sanitised before; now every character
+        # Windows forbids in a filename (<>:"/\|?* and controls) becomes
+        # "_", and a trailing dot/space (also illegal there) is stripped.
+        # Linux filenames allowed ":" all along, which is why the VM's
+        # tests never caught this. get/put are also best-effort now: a
+        # cache is not storage, so a failed read is a miss and a failed
+        # write is skipped, never an exception into the caller.
+        safe = "".join("_" if (c in '<>:"/\\|?*' or ord(c) < 32) else c
+                       for c in key)
+        safe = safe.replace("@", "_at_").rstrip(". ")
         return self.dir / f"{safe}.json"
 
     def get(self, key: str):
         p = self._path(key)
-        if p.exists():
-            self.hits += 1
-            return json.loads(p.read_text(encoding="utf-8"))
+        try:
+            if p.exists():
+                self.hits += 1
+                return json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass  # unreadable cache entry == a miss, not a crash
         self.misses += 1
         return None
 
     def put(self, key: str, data: dict) -> None:
-        self._path(key).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        try:
+            self._path(key).write_text(json.dumps(data, indent=2), encoding="utf-8")
+        except OSError:
+            pass  # best-effort cache: a failed write never fails a scan

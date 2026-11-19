@@ -40,6 +40,116 @@ ROUTE_DECORATORS = (
 )
 
 
+def _is_route_decorator(text: str) -> bool:
+    """True for framework route decorators. False for lookalikes such as
+    @mock.patch (19 Nov 2026: the '.patch' substring matched mock.patch
+    and created 123 phantom entry points on MkDocs)."""
+    if "mock.patch" in text or text.startswith("mock."):
+        return False
+    return any(k in text for k in ROUTE_DECORATORS)
+
+
+def _entry_module(rel: str) -> str:
+    """Module name for a file path relative to the project root, matching
+    callgraph._module_name exactly (a root __init__.py is module '', a
+    pkg/__init__.py is module 'pkg'). The old inline computation gave
+    '__init__' for a root __init__.py, which matched no graph function."""
+    parts = rel.replace("/", ".").removesuffix(".py").split(".")
+    if parts and parts[-1] == "__init__":
+        parts = parts[:-1]
+    return ".".join(parts)
+
+
+def _program_modules(root: Path, graph: Graph, mode: str) -> set[str]:
+    """Modules that can actually execute as programs: files named
+    main/app/cli/__main__, modules with an `if __name__ == "__main__"`
+    guard, console-script target modules, the only module of a
+    single-file project, and (library mode) top-level __init__ modules
+    — importing the library executes them."""
+    programs: set[str] = set()
+    py_files = sorted(root.rglob("*.py"))
+    for p in py_files:
+        rel = str(p.relative_to(root))
+        module = _entry_module(rel)
+        if p.stem in ("main", "app", "cli", "__main__"):
+            programs.add(module)
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If):
+                test = ast.unparse(node.test) if hasattr(ast, "unparse") else ""
+                if "__name__" in test and "__main__" in test:
+                    programs.add(module)
+                    break
+    if len(py_files) == 1:
+        p = py_files[0]
+        programs.add(_entry_module(str(p.relative_to(root))))
+    if mode == "library":
+        for p in py_files:
+            if p.name == "__init__.py":
+                programs.add(_entry_module(str(p.relative_to(root))))
+    for target in _console_scripts(root).values():
+        mod = target.split(":")[0]
+        if mod:
+            programs.add(mod)
+    return programs
+
+
+def _reachable_modules(root: Path, graph: Graph, mode: str) -> set[str]:
+    """Program modules + modules they import, transitively (over the
+    project import graph). A module in this set can execute; anything
+    else is dead code for entry-point purposes."""
+    programs = _program_modules(root, graph, mode)
+    reached = set(programs)
+    stack = list(programs)
+    while stack:
+        cur = stack.pop()
+        for nxt in graph.file_imports.get(cur, set()):
+            if nxt not in reached:
+                reached.add(nxt)
+                stack.append(nxt)
+    return reached
+
+
+def find_unsupported_entrypoints(root: str | Path, graph: Graph) -> list[str]:
+    """Entry points the analyser detected but cannot model (ChatGPT §5):
+    class-based Django views (MyView.as_view()) and console-script
+    targets that do not resolve to a project function. Reported in the
+    ledger, never guessed."""
+    root = Path(root)
+    out: list[str] = []
+    for p in root.rglob("urls.py"):
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            fname = ""
+            if isinstance(func, ast.Name):
+                fname = func.id
+            elif isinstance(func, ast.Attribute):
+                fname = func.attr
+            if fname not in ("path", "re_path") or len(node.args) < 2:
+                continue
+            view = node.args[1]
+            if (isinstance(view, ast.Call) and isinstance(view.func, ast.Attribute)
+                    and view.func.attr == "as_view"):
+                cls = ast.unparse(view.func.value) if hasattr(ast, "unparse") else "?"
+                out.append(f"{p.relative_to(root)}: class-based view {cls}.as_view() is unsupported")
+    for name, target in _console_scripts(root).items():
+        func = target.split(":")[-1].split(".")[-1]
+        mod = target.split(":")[0].rsplit(".", 1)[0] if ":" in target else ""
+        if not _resolve_simple(graph, func, prefer_module=mod or None):
+            out.append(f"console_scripts '{name}' -> '{target}' does not resolve to a project function")
+    return out
+
+
 def _resolve_simple(graph: Graph, name: str, prefer_module: str | None = None) -> str | None:
     """Resolve a simple function name to a qualified function.
     Prefer `prefer_module` (e.g. views), then same-module, then unique.
@@ -168,7 +278,7 @@ def find_entrypoints_with_evidence(root: str | Path, graph: Graph) -> dict[str, 
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 for d in node.decorator_list:
                     text = ast.unparse(d) if hasattr(ast, "unparse") else ""
-                    if any(k in text for k in ROUTE_DECORATORS):
+                    if _is_route_decorator(text):
                         q = _resolve_simple(graph, node.name)
                         if q:
                             evidence[q] = f"framework dispatch: {text} -> {node.name}() (framework invokes handler, no direct call in code)"
@@ -203,17 +313,19 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
         except (SyntaxError, OSError):
             continue
         rel = str(p.relative_to(root))
-        module = rel.replace("/", ".").removesuffix(".py").removesuffix(".__init__")
+        module = _entry_module(rel)
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 q = f"{module}.{node.name}" if module else node.name
-                # main()
-                if node.name == "main":
-                    entries.add(q)
+                # main() is NOT an entry point by itself (ChatGPT Critical
+                # 4, 19 Nov 2026): a helper called main() in a module
+                # nothing runs is dead code. It becomes reachable only by
+                # being called — from a __main__ guard, a console script,
+                # or another entry (the BFS follows those edges).
                 # Decorators: @app.route, @app.get, @click.command, etc.
                 for d in node.decorator_list:
                     text = ast.unparse(d) if hasattr(ast, "unparse") else ""
-                    if any(k in text for k in ROUTE_DECORATORS):
+                    if _is_route_decorator(text):
                         entries.add(q)
                 # Public API in __init__ — library mode only (Phase 3 fix).
                 if mode == "library" and rel.endswith("__init__.py") and not node.name.startswith("_"):
@@ -229,13 +341,17 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
                             q = _resolve_simple(graph, sub.func.id, prefer_module=module)
                             if q:
                                 entries.add(q)
-    # Phase 2: top-level module code runs on import, so a <module>
-    # pseudo-node with outgoing calls is a real entry point. Without
-    # this, a project that calls yaml.load at import time (no main())
-    # would be missed entirely.
+    # Phase 2: top-level module code runs on import — but only for
+    # modules that can actually execute (ChatGPT Critical 4, 19 Nov 2026):
+    # program modules and modules they import, transitively. A module
+    # nothing imports and nobody runs is dead code, not an entry point
+    # (never_imported.py's top-level yaml.load used to be reachable).
+    reachable_mods = _reachable_modules(root, graph, mode)
     for q in graph.functions:
         if q.endswith(".<module>") and graph.edges.get(q):
-            entries.add(q)
+            mod = q[: -len(".<module>")] if q != "<module>" else ""
+            if mod in reachable_mods:
+                entries.add(q)
     if mode == "library":
         # Prefer __all__ when the package declares it: it is the package's
         # own statement of its public surface. Otherwise all public funcs.

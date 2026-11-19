@@ -2,15 +2,15 @@
 """One-command verification for pyreach, Phases 1-5 + explainer + HTML report.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 26 fixture scans + prompt + witness + explain + quiet/HTML
+    python3 verify.py            # offline: pytest + 32 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (120 tests) — the deterministic core + explainer + HTML report + LLM status
-  B. all 26 fixtures give the expected verdict AND exit code
+  A. the unit suite (171 tests) — the deterministic core + explainer + HTML report + LLM status
+  B. all 32 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
@@ -23,6 +23,13 @@ What it proves, in order:
   H. `pyreach llm-test` with no key reports kind no_key, exit 1, and
      prints no key value (the MkDocs diagnostic: a silent LLM failure
      must name itself, not look like "not tried")
+  I. Phase 7 `pyreach scan-all` (offline, --advisory-dir): every
+     dependency resolved, PyYAML scanned and reachable, a package with
+     no advisory file marked not-checked, a range-only dependency
+     skipped and listed — never guessed, never silently dropped
+  J. Phase 8 OpenVEX aggregation: a reachable finding blocks the
+     not_affected statement for its advisory; an all-clear advisory
+     still gets exactly one statement
   G. (--live) the real OSV -> fix-commit -> candidates pipeline
      for PyYAML 5.3.1, the case Phase 1 was built on (runs last)
 """
@@ -65,6 +72,13 @@ EXPECTED = {
     "app_proof_args": ("reachable", 2),
     "app_getattr_mixed": ("uncertain", 0),
     "app_load_collision": ("reachable", 2),
+    # Phase 8 (ChatGPT review fixes, 19 Nov 2026)
+    "app_unresolved_attr": ("uncertain", 0),   # Critical 1: .load() via variable
+    "app_never_imported": ("not_reachable", 0),  # Critical 4: dead module
+    "app_vex_full": ("reachable", 2),          # Critical 2: yaml.load reachable
+    "app_unparsed": ("uncertain", 0),          # Critical 5: completeness gate
+    "app_mockpatch": ("not_reachable", 0),     # Critical 4: @mock.patch phantom
+    "app_dunder": ("uncertain", 0),            # dunder __getattr__ site runs
 }
 
 passed = failed = 0
@@ -121,15 +135,15 @@ def main() -> int:
 
     print("A. unit tests")
     # pytest if present, else stdlib unittest (the tests are unittest
-    # TestCases, so both run the same 120 tests). pytest is not part of
+    # TestCases, so both run the same 145 tests). pytest is not part of
     # a default Python install, and a fresh VM may not have it.
     r = run(["-m", "pytest", "tests", "-q"])
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (120 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (171 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (120 tests)", r.returncode == 0,
+        check("pytest suite (171 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -257,6 +271,74 @@ def main() -> int:
           r.returncode == 1 and "no_key" in r.stdout
           and "sk-" not in r.stdout and "sk-" not in r.stderr,
           f"exit={r.returncode} stdout={r.stdout[-200:]!r} stderr={r.stderr[-200:]!r}")
+
+    print("I. Phase 7 scan-all (offline, --advisory-dir)")
+    r = run(["-m", "pyreach.cli", "scan-all", "fixtures/app_scanall",
+             "--advisory-dir", "fixtures/app_scanall_advisories",
+             "--no-llm", "--no-html",
+             "--out", str(tmp / "s.json"), "--vex", str(tmp / "s-vex.json"),
+             "--cache-dir", str(tmp / "cache")])
+    rep = _read_report(tmp / "s.json")
+    pkgs = {p["name"]: p for p in (rep or {}).get("packages", [])}
+    yaml_load = [x for x in (rep or {}).get("results", [])
+                 if x.get("vulnerable_function") == "yaml.load"]
+    check("scan-all: PyYAML scanned+reachable, requests not-checked, range-only skipped",
+          (rep or {}).get("mode") == "scan-all"
+          and pkgs.get("PyYAML", {}).get("status") == "scanned"
+          and pkgs.get("PyYAML", {}).get("version") == "5.3.1"
+          and pkgs.get("PyYAML", {}).get("results", {}).get("reachable") == 1
+          and pkgs.get("requests", {}).get("status") == "not-checked"
+          and pkgs.get("pyreach-skip-demo", {}).get("status") == "skipped"
+          and len(yaml_load) == 1 and yaml_load[0]["verdict"] == "reachable"
+          and "scan-all packages:" in r.stdout
+          and r.returncode == 2,
+          f"packages={pkgs} exit={r.returncode}")
+    r = run(["-m", "pyreach.cli", "scan-all", "fixtures/app_scanall",
+             "--advisory-dir", "fixtures/app_scanall_advisories",
+             "--only", "pyyaml",
+             "--no-llm", "--no-html",
+             "--out", str(tmp / "s2.json"), "--vex", str(tmp / "s2-vex.json"),
+             "--cache-dir", str(tmp / "cache")])
+    rep2 = _read_report(tmp / "s2.json")
+    check("scan-all --only pyyaml scans just that package",
+          [p["name"] for p in (rep2 or {}).get("packages", [])] == ["PyYAML"]
+          and r.returncode == 2,
+          f"packages={(rep2 or {}).get('packages')} exit={r.returncode}")
+
+    print("J. Phase 8 OpenVEX aggregation (ChatGPT Critical 2, 19 Nov 2026)")
+    # app_vex_full against the REAL PyYAML advisory: yaml.load is
+    # reachable, so the advisory gets NO not_affected statement even
+    # though two candidates are not_reachable.
+    REAL = str(ROOT / "examples" / "advisory-real-pyyaml.json")
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_vex_full",
+             "--advisory", REAL, "--no-llm", "--no-html",
+             "--out", str(tmp / "j1.json"), "--vex", str(tmp / "j1-vex.json"),
+             "--cache-dir", str(tmp / "cache")])
+    vex1 = _read_report(tmp / "j1-vex.json") or {}
+    check("app_vex_full + real advisory: reachable present, 0 VEX statements",
+          len(vex1.get("statements", [])) == 0 and r.returncode == 2,
+          f"statements={vex1.get('statements')} exit={r.returncode}")
+    # app_safe: the one candidate is genuinely not_reachable and the
+    # ledger is complete, so exactly one statement is emitted.
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_safe",
+             "--advisory", ADV, "--no-llm", "--no-html",
+             "--out", str(tmp / "j2.json"), "--vex", str(tmp / "j2-vex.json"),
+             "--cache-dir", str(tmp / "cache")])
+    vex2 = _read_report(tmp / "j2-vex.json") or {}
+    check("app_safe: 1 VEX statement for the all-clear advisory",
+          len(vex2.get("statements", [])) == 1
+          and vex2["statements"][0]["status"] == "not_affected"
+          and r.returncode == 0,
+          f"statements={vex2.get('statements')} exit={r.returncode}")
+    # app_never_imported: dead module, same all-clear result.
+    r = run(["-m", "pyreach.cli", "scan", "fixtures/app_never_imported",
+             "--advisory", ADV, "--no-llm", "--no-html",
+             "--out", str(tmp / "j3.json"), "--vex", str(tmp / "j3-vex.json"),
+             "--cache-dir", str(tmp / "cache")])
+    vex3 = _read_report(tmp / "j3-vex.json") or {}
+    check("app_never_imported: 1 VEX statement, dead module not an entry",
+          len(vex3.get("statements", [])) == 1 and r.returncode == 0,
+          f"statements={vex3.get('statements')} exit={r.returncode}")
 
     if live:
         print("G. live OSV fetch (network)")

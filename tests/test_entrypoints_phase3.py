@@ -94,11 +94,15 @@ class TestEntryPointsPhase3(unittest.TestCase):
         # such as `if __name__ == "__main__": main()` runs on import).
         # What must not change: the expected entries are present, and
         # the verdicts are the same.
+        # 19 Nov 2026 (ChatGPT Critical 4): app_route's main() is dead
+        # code — it is never invoked (no __main__ guard, no console
+        # script) — so it is no longer an entry point. upload() still
+        # is (route decorator) and the verdict is unchanged.
         for fixture, expected_entries, expected in [
             ("app_vuln", {"app.main"}, "reachable"),
             ("app_safe", {"app.main"}, "not_reachable"),
             ("app_dead", {"app.main"}, "not_reachable"),
-            ("app_route", {"app.upload", "app.main"}, "reachable"),
+            ("app_route", {"app.upload"}, "reachable"),
         ]:
             _, entries, _, res = scan(fixture)
             self.assertTrue(expected_entries <= entries, fixture)

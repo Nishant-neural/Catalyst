@@ -123,6 +123,8 @@ def fetch_github_diff(repo: str, sha: str, cache: Cache | None = None) -> str:
 def fetch_github_file(repo: str, sha: str, path: str) -> str:
     """Fetch a single file at a commit, via raw.githubusercontent.com."""
     requests = _get_requests()
+    # Diff headers carry a b/ (or a/) prefix; strip it defensively.
+    path = path.removeprefix("b/").removeprefix("a/")
     # Strip leading lib/ or lib3/ prefixes? Caller passes the diff path as-is;
     # try it, then try without a leading lib/ segment.
     for p in (path, path.removeprefix("lib/"), path.removeprefix("lib3/")):
@@ -131,6 +133,34 @@ def fetch_github_file(repo: str, sha: str, path: str) -> str:
         if r.status_code == 200:
             return r.text
     return ""
+
+
+def fetch_github_parent_sha(repo: str, sha: str, cache: Cache | None = None) -> str | None:
+    """Parent commit SHA via the public GitHub API (no key). Cached by
+    (repo, sha); a commit's parent never changes, so the cache cannot go
+    stale. Best-effort: None on any failure — the caller then runs the
+    new-side mapping only, exactly as before (19 Nov 2026, ChatGPT §6:
+    old_sources used to stay {} forever, so the both-sides mapping in
+    diff_to_functions never ran)."""
+    if cache is not None:
+        hit = cache.get(cache_key("github-parent", repo, sha))
+        if hit is not None:
+            return hit.get("parent_sha")
+    try:
+        requests = _get_requests()
+        r = requests.get(
+            f"https://api.github.com/repos/{repo}/commits/{sha}",
+            headers={"User-Agent": "pyreach/0.1.0",
+                     "Accept": "application/vnd.github+json"},
+            timeout=30)
+        r.raise_for_status()
+        parents = r.json().get("parents", [])
+    except Exception:
+        return None
+    parent = parents[0].get("sha") if parents else None
+    if cache is not None and parent:
+        cache.put(cache_key("github-parent", repo, sha), {"parent_sha": parent})
+    return parent
 
 
 def candidates_from_test_diff(diff_text: str) -> list[VulnerableFunction]:
@@ -257,7 +287,13 @@ def analyse_advisory_live(package: str, version: str, cache: Cache | None = None
             }]
             results.append(entry)
             continue
-        entry["diff_files"] = sorted({l[4:].strip() for l in diff.splitlines() if l.startswith("+++ ")})
+        # Diff headers are "+++ b/lib/yaml/constructor.py" — strip the
+        # b/ prefix (19 Nov 2026, ChatGPT §6): without it every file
+        # fetch 404s and the both-sides mapping silently gets no sources.
+        entry["diff_files"] = sorted({
+            l[4:].strip().removeprefix("b/").removeprefix("a/")
+            for l in diff.splitlines() if l.startswith("+++ ")
+        })
         entry["diff_lines"] = len(diff.splitlines())
         # 1) Function-level mapping (both sides, via diff_to_functions)
         #    For the real PyYAML case this returns [] — the fix is module-level.
@@ -265,11 +301,30 @@ def analyse_advisory_live(package: str, version: str, cache: Cache | None = None
         #    fetched sources for the changed files.
         sources: dict[str, str] = {}
         old_sources: dict[str, str] = {}
+        # The vulnerable version's sources come from the fix commit's
+        # parent (19 Nov 2026, ChatGPT §6): old_sources used to stay {}
+        # forever, so the both-sides mapping never ran. Best-effort: if
+        # the parent lookup fails, old_sources stays empty and the
+        # new-side mapping + heuristics still run.
+        parent_sha = fetch_github_parent_sha(repo, sha, cache=cache)
         for path in entry["diff_files"]:
             if path.endswith(".py") and "test" not in path:
-                txt = fetch_github_file(repo, sha, path)
+                # Best-effort: a missing requests install (diff came
+                # from cache) must not crash the live fetch — the
+                # new-side mapping and heuristics still run.
+                try:
+                    txt = fetch_github_file(repo, sha, path)
+                except Exception:
+                    txt = ""
                 if txt:
                     sources[path] = txt
+                if parent_sha:
+                    try:
+                        old_txt = fetch_github_file(repo, parent_sha, path)
+                    except Exception:
+                        old_txt = ""
+                    if old_txt:
+                        old_sources[path] = old_txt
         func_cands = diff_to_functions(diff, sources, commit=sha, old_sources=old_sources or None)
         cands = list(func_cands)
         # 2) Module-level + text candidates

@@ -129,6 +129,46 @@ Verified from a fresh extract of `pyreach-phase5-real-projects.zip`
   count. Recorded here, deliberately NOT fixed in this verification
   pass, so the verified zip stays the verified zip.
 
+## Re-run — Phase 8, 19 Nov 2026 (fresh clones, same commits)
+
+Same three projects, same commands, `--no-llm`, after the ChatGPT
+review fixes. Verdict splits are **unchanged** — MkDocs 4/3,
+Cookiecutter 7/7, pre-commit 7/7 — but the reasons and the ledger
+are honest now, and the entry counts dropped where phantoms lived:
+
+| Project | Parsed | Entries | Verdicts | Uncertain rate | Ledger notes |
+|---|---|---|---|---|---|
+| MkDocs | 54/65 | 1,092 (was 1,217) | 4 reachable / 3 uncertain | 43% | dynamic_unresolved 2, ambiguous 1,980 |
+| Cookiecutter | 77/90 | 456 | 0 / 7 uncertain | 100% | dynamic_unresolved 0, ambiguous 12 |
+| pre-commit | 121/134 | 33 | 0 / 7 uncertain | 100% | dynamic_unresolved 2, ambiguous 301 |
+
+What changed per project:
+
+- **MkDocs.** The 125 missing entries are the `@mock.patch`
+  phantoms, fixed in Phase 8. The 3 uncertain are back to the honest
+  story: "a dynamic trigger is reachable | Phase 4: resolved 8/10
+  dynamic sites safe, 2 still unknown" — the 2 unknown are the
+  `config_options.py:549` getattr sites inside `Optional.__getattr__`,
+  which the BFS-only filter had silently dropped in the first Phase 8
+  run (it then claimed "all 5 sites resolved"). `yaml.load` is still
+  reachable via `mkdocs.utils.yaml.yaml_load`.
+- **Cookiecutter.** The 3 library-internal candidates are uncertain
+  (dependency not parsed); the other 4 are uncertain via the
+  completeness gate (13/90 files unparsed), not via a vague dynamic
+  trigger. Still 0 not_reachable anywhere — the tool still cannot
+  prove not_reachable on a real project, and now says why per
+  candidate instead of hiding behind one global reason.
+- **pre-commit.** `yaml.load` is now uncertain via the **reference
+  rule**: it is referenced without being called, as
+  `functools.partial(yaml.load, Loader=CSafeLoader)` in
+  `pre_commit/yaml.py` — the partial blind spot from the limits below,
+  now surfacing honestly instead of being missed. The other uncertain
+  candidates cite 1/3 dynamic sites resolved, 2 unknown.
+
+Reports: `../real-projects-pyreach/*-report-p8.json` (same folder as
+the earlier runs). The 123-phantom finding from the verification
+section above is now FIXED (see MkDocs entries), not just recorded.
+
 ## Files
 
 - Full reports (after fixes): `../real-projects-pyreach/`

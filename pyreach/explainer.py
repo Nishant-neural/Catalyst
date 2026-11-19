@@ -34,6 +34,12 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from .reach import (
+    _is_library_internal,
+    _is_project_function as _target_project_defined,
+    reachable_modules,
+    site_can_run,
+)
 from .resolver import DEFAULT_MODEL, resolve_with_llm_status
 
 FOOTER = ("This explanation is limited to the evidence above. "
@@ -132,19 +138,6 @@ def _unparsed_files(root: Path) -> list[str]:
     return bad
 
 
-def _is_library_internal(qualified: str) -> bool:
-    return "construct_" in qualified
-
-
-def _target_project_defined(graph, target: str) -> bool:
-    """Is the target defined in project code (not an external node)?"""
-    for q, info in graph.functions.items():
-        if (q == target or q.endswith("." + target)
-                or q.split(".")[-1] == target) and info.file != "external":
-            return True
-    return False
-
-
 def derive_blocker(result, graph, root: Path, entries: set[str]) -> str:
     """The blocker for one uncertain result, derived deterministically.
 
@@ -156,22 +149,30 @@ def derive_blocker(result, graph, root: Path, entries: set[str]) -> str:
     """
     target = result.vulnerable_function
     reachable = _reachable_nodes(graph, entries)
+    modules = reachable_modules(graph, entries)
     # 1. Library internal, never defined in project code: the dependency
     #    was not parsed, so no project-side evidence can clear it.
-    if _is_library_internal(target) and not _target_project_defined(graph, target):
+    if _is_library_internal(target, graph) and not _target_project_defined(graph, target):
         return "library_not_parsed"
-    # 2. A dynamic trigger reachable from an entry point.
+    # 2. A dynamic trigger in code that can execute (site_can_run covers
+    #    dunders and module top-level code in reachable modules, which
+    #    BFS alone misses — MkDocs config_options.py:549).
     for d in graph.dynamic:
-        if d.get("caller") in reachable:
+        if site_can_run(graph, entries, reachable, modules, d):
             return "dynamic_call"
     # 3. Ambiguous edges: prefer ones whose candidates could be the target.
     simple = target.split(".")[-1] if target else ""
     for caller, cands in graph.ambiguous.items():
-        if caller in reachable and any(
-                c.split(".")[-1] == simple or c == target for c in cands):
+        info = graph.functions.get(caller)
+        site = {"caller": caller, "file": info.file if info else ""}
+        if not site_can_run(graph, entries, reachable, modules, site):
+            continue
+        if any(c.split(".")[-1] == simple or c == target for c in cands):
             return "ambiguous_name"
     for caller in graph.ambiguous:
-        if caller in reachable:
+        info = graph.functions.get(caller)
+        site = {"caller": caller, "file": info.file if info else ""}
+        if site_can_run(graph, entries, reachable, modules, site):
             return "ambiguous_name"
     # 4. Unparsed files leave holes in the graph.
     discovered = len(list(root.rglob("*.py")))

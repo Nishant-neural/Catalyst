@@ -2,6 +2,7 @@
 concat, var-to-var, importlib), the 10-rule verifier, and the
 resolve_getattr_case helper (constants only — no network, no key)."""
 import json
+import re
 import unittest
 from pathlib import Path
 import sys
@@ -14,6 +15,7 @@ from pyreach.entrypoints import find_entrypoints
 from pyreach.reach import analyze
 from pyreach.resolver import (
     CONFIDENCE_THRESHOLD,
+    build_prompt,
     constant_propagate_getattr,
     resolve_getattr_case,
     verify_answer,
@@ -161,3 +163,41 @@ class TestPhase4Aggregation(unittest.TestCase):
         self.assertEqual(rep["results"][0]["verdict"], "uncertain")
         self.assertEqual(code, 0)
         self.assertIn("1/2", rep["results"][0]["reason"])
+
+
+class TestPromptContract(unittest.TestCase):
+    """19 Nov 2026 regression, live MkDocs run: the model answered 3
+    Phase 4 calls with can_reach false + empty possible_values (one
+    also confidence 0.0), and the verifier correctly rejected all 3.
+    Two prompt defects fed that: the JSON example showed
+    "confidence": 0.0, which the model copied verbatim, and nothing in
+    the prompt said a false answer needs a non-empty possible_values
+    list — rule 10 demanded something the prompt never asked for."""
+
+    def _prompt(self):
+        return build_prompt("x = getattr(mod, name)", ["yaml.load"],
+                            ["load"], ["yaml.load"], "app.py", 1)
+
+    def test_example_confidence_meets_threshold(self):
+        m = re.search(r'"confidence":\s*([0-9.]+)', self._prompt())
+        self.assertIsNotNone(m, "prompt must show an example confidence")
+        self.assertGreaterEqual(float(m.group(1)), CONFIDENCE_THRESHOLD)
+
+    def test_false_answer_must_list_values(self):
+        self.assertIn("possible_values MUST list every value",
+                      self._prompt())
+
+    def test_rejected_shape_still_rejected(self):
+        # The exact answers from the live run must still fail: false
+        # with no values, and 0.0 confidence. The prompt fix must not
+        # have weakened the verifier — only the prompt changed.
+        ok, failures = verify_answer(
+            {"can_reach": False, "possible_values": [],
+             "vulnerable_hit": None, "reason": "x",
+             "evidence_lines": [1], "confidence": 0.0},
+            SYMS, "x = getattr(mod, name)\n", "uncertain",
+            vulnerable=["yaml.load"])
+        self.assertFalse(ok)
+        self.assertIn("can_reach false needs non-empty possible_values",
+                      failures)
+        self.assertTrue(any("below threshold" in f for f in failures))

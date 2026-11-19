@@ -1,0 +1,7 @@
+[project]
+name = "demo"
+dependencies = [
+  "PyYAML==5.3.1",
+  "requests==2.31.0",
+  "pyreach-skip-demo>=1.0",
+]
