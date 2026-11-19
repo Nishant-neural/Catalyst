@@ -1018,12 +1018,45 @@ verification: MkDocs 2862536, Cookiecutter c88fbe9, pre-commit
 ba5c420): verdict splits unchanged — MkDocs 4 reachable / 3
 uncertain, Cookiecutter 7/7 uncertain, pre-commit 7/7 uncertain —
 with better reasons and an honest ledger. MkDocs: entries 1,092,
-dynamic_unresolved 2, ambiguous 1,980, unparsed 11/65. Cookiecutter:
-entries 456, gate blocks 4 candidates on 13 unparsed files.
-Pre-commit: entries 33, yaml.load uncertain via the reference rule
-(the `functools.partial` wrapper). Full numbers in REAL_PROJECTS.md.
-`verify.py` offline: **47 passed, 0 failed** (was 38); unit suite
-**173 tests** (was 149); 32 fixtures.
+dynamic_unresolved 2, ambiguous 1,980, 65/65 files parsed.
+Cookiecutter: entries 456, gate blocks 4 candidates on 2 unparsed
+files (test hook templates with Jinja syntax). Pre-commit: entries
+33, yaml.load uncertain via the reference rule (the
+`functools.partial` wrapper). Full numbers in REAL_PROJECTS.md and
+EVALUATION.md. `verify.py` offline: **50 passed, 0 failed** (was 47);
+unit suite **182 tests** (was 173); 35 fixtures.
+
+## Evaluation fixes (19 Nov 2026)
+
+Scanning 4 more real projects (yamllint, bandit, ansible-lint, kedro)
+for the evaluation found 5 more bugs, all fixed with fixtures in
+`tests/test_eval_fixes.py` (9 tests) — full story in EVALUATION.md:
+
+1. Console-script module stripped (`yamllint.cli:run` read as module
+   `yamllint`); fixed at all 3 call sites.
+2. Stdlib names flagged as unresolved project imports (ansible-lint's
+   `collections/` fixture dirs, ~100 false ledger entries).
+3. Ledger "parsed" counted files with functions, not files parsed
+   (empty `__init__.py` counted as unparsed; MkDocs 54/65 -> 65/65).
+4. Re-exported console scripts did not resolve (cookiecutter
+   `__main__:main`, kedro `cli:main` — `main` is imported, not
+   defined); `_resolve_simple` follows the script module's imports
+   one level, with exact module matching (a prefix match falsely
+   called two submodule functions ambiguous).
+5. `__all__` discarded the console-script entry: in library mode with
+   a root `__all__`, `find_entrypoints` returned ONLY the `__all__`
+   names — kedro's real entry point never became a BFS start
+   (entries 4 -> 93 after the merge).
+
+Also fixed from Nishant's Windows `verify.py` run the same day: the
+HTML reads crashed on cp1252 (curly quotes in the template; verify.py
+and the tests now read UTF-8), and two "without key" tests leaked his
+real `.env` key through the resolver's dotenv fallback (the tests now
+patch the loader at its source module and clear the environment).
+The passing single-test re-run he sent is itself the proof of the
+leak: the test took 3.15s, i.e. it made a live model call — with a
+real key present, that test is flaky by construction, and its outcome
+depends on what the model says on that call.
 
 ## Risks and trade-offs
 
@@ -1046,3 +1079,81 @@ Small open-weight model only, temp 0 — current default
 (`resolver.py`: `FREE_MODEL_FALLBACKS`); free slugs get delisted, so
 re-check the live OpenRouter catalog before pinning a new default.
 No paid LLM, no GPU, CPU laptop is enough.
+
+## Phase 10 — demo fixes + three-repo demo (19 Nov 2026)
+
+The demo (scan Flask, requests, httpx whole) kept exposing real
+product gaps. Each was fixed, regression-tested, and re-verified;
+the demo now runs from `demo/run-demo.sh` with pre-seeded advisory
+files (`demo/advisories/`) and 2023-pinned requirements
+(`demo/requirements/`). No LLM anywhere in the demo: explanations are
+the deterministic explainer's output (`--explain --no-llm`).
+
+Fixes, all 19 Nov 2026:
+
+1. **src./lib. prefix stripped from candidate names** (`advisory.py`
+   `_module_from_path`, also drops trailing `.__init__`). Diff paths
+   like `src/jinja2/filters.py` produced `src.jinja2.filters.do_attr`,
+   whose first segment never matched an imported module — so
+   `werkzeug.security.safe_join` was classified library-internal even
+   though Flask imports werkzeug, and propagation could not link
+   `src.jinja2.*` to `jinja2.*`. Now `jinja2.filters.do_attr`,
+   `werkzeug.security.safe_join`, `urllib3.util.retry.Retry.__init__`.
+   Fixture: `test_src_prefix_stripped_from_qualified_names`.
+2. **Single-node reachable needs high confidence** (`reach.py`
+   `analyze`). A medium/low text candidate matching a same-named
+   project attribute produced a vacuous 1-node "reachable": the
+   Werkzeug form-parse advisory mentions `Request.max_content_length`
+   in its text, and Flask's own property of that name matched it.
+   Now uncertain with a "single-node match" reason. Fixture
+   `app_same_name` + `TestSingleNodeMatch` (medium → uncertain, high
+   → reachable).
+3. **`. __init__` candidates match the class node** (`reach.py`
+   `bfs_path`). `Retry(...)` calls `Retry.__init__`, but the graph
+   records constructor calls as calls to the class. A candidate
+   ending in `.__init__` now also matches the class node. Fixture
+   `app_init_call` + `TestInitCall`.
+4. **Relative imports resolved in pass 1** (`callgraph.py`
+   `visit_ImportFrom`). `from .adapters import HTTPAdapter` was
+   recorded as `adapters.HTTPAdapter`, so the call never resolved to
+   `src.requests.adapters.HTTPAdapter` and the Retry path broke.
+   Now resolved against the file's package, the same way
+   `_analyze_imports` does.
+5. **Class → `__init__` edges** (`callgraph.py` `build_graph`).
+   Calling a class runs its `__init__`; without the edge a path
+   through a constructor call stopped at the class node. Fixture
+   `app_rel_import` + `test_relative_import_and_constructor_chain`:
+   `pkg.main.main → pkg.helpers.Adapter → pkg.helpers.Adapter.__init__
+   → urllib3.util.retry.Retry`.
+6. **Class names in `__all__` add `__init__` as an entry**
+   (`entrypoints.py`). requests' `__all__` lists `Session` (a class),
+   but there is no function node for the class itself, so
+   `Session.__init__` was never an entry and the Retry path from
+   Session construction was invisible. Fixture `app_all_class` +
+   `TestAllClass` (helper / non-exported method stay non-entries).
+
+Demo results (19 Nov 2026, `--no-llm --explain`, runtime deps only):
+
+| repo | deps | advisories | reachable | uncertain | not_reachable |
+|------|------|------------|-----------|-----------|---------------|
+| Flask (2023 pins) | 6 | 4 | 0 | 9 | 0 |
+| requests (2023 pins) | 4 | 2 | 1 | 2 | 0 |
+| httpx (2023 pins) | 4 | 3 | 1 | 7 | 0 |
+| total | 14 | 9 | 2 | 18 | 0 |
+
+Reachable: requests → `urllib3.util.retry.Retry.__init__`
+(GHSA-34jh-p97f-mpxf): `Session.__init__ → HTTPAdapter →
+HTTPAdapter.__init__ → Retry`. httpx → `idna.encode`
+(GHSA-jjg7-2v4v-x38h): `URL.__init__ → urlparse → encode_host →
+idna.encode`. 18 pre-seeded deterministic explanations (0 LLM calls).
+At latest versions the three repos have 0 advisories (verified for
+requests) — the 2023 pins are versions they actually shipped with.
+
+Known demo-time findings (not fixed, recorded for later): scan-all
+reads the repo lockfile, so Flask's `uv.lock` adds 73 transitive
+(mostly dev) packages and the live fix-commit fetch then takes 5+
+minutes and burns the unauthenticated GitHub quota (0/60 remaining
+at 19 Nov 2026 ~11:10 IST); the demo uses `--only` runtime deps +
+pre-seeded advisory files to avoid that. Two advisories were dropped
+from the demo set (no fix commit in OSV → no identifiable function:
+GHSA-qccp-gfcp-xxvc, GHSA-65pc-fj4g-8rjx). See `demo/README.md`.

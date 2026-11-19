@@ -93,7 +93,7 @@ class TestHtmlReport(unittest.TestCase):
             self.assertTrue(html_path.exists())
             rep = json.loads(out.read_text())
             self.assertEqual(rep["html_report"], "r.html")
-            page = html_path.read_text()
+            page = html_path.read_text(encoding="utf-8")
             self.assertIn("yaml.load", page)
             self.assertIn("dynamic_call", page)
             self.assertIn("The verdict remains UNCERTAIN", page)
@@ -146,7 +146,7 @@ class TestHtmlReport(unittest.TestCase):
                           "--out", str(html_path)])
             self.assertEqual(r2.returncode, 0, r2.stdout + r2.stderr)
             self.assertTrue(html_path.exists())
-            self.assertIn("yaml.load", html_path.read_text())
+            self.assertIn("yaml.load", html_path.read_text(encoding="utf-8"))
             # Default --out: <report>.html next to the report.
             r3 = run_cli(["report", "--report", str(out)])
             self.assertEqual(r3.returncode, 0, r3.stdout + r3.stderr)

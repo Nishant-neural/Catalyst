@@ -31,7 +31,16 @@ class Result:
 def bfs_path(graph: Graph, starts: set[str], target: str) -> list[str] | None:
     """Shortest path from any start to target, or None."""
     # Target may be a simple name or qualified; resolve to qualified nodes
-    targets = {t for t in graph.functions if t == target or t.endswith("." + target) or t.split(".")[-1] == target}
+    # A candidate ending in .__init__ is invoked by constructing the
+    # class (Retry(...) calls Retry.__init__), and the call graph records
+    # constructor calls as calls to the class, not to __init__ — so a
+    # .__init__ target also matches the class node (19 Nov 2026: this
+    # is what makes urllib3 Retry.__init__ reachable from requests,
+    # which constructs a Retry in every HTTPAdapter).
+    targets = set()
+    for t in (target, target.removesuffix(".__init__")):
+        targets |= {n for n in graph.functions
+                    if n == t or n.endswith("." + t) or n.split(".")[-1] == t}
     if not targets:
         return None
     seen: dict[str, str | None] = {s: None for s in starts}
@@ -254,6 +263,28 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
         for vf in adv.vulnerable_functions:
             path = bfs_path(graph, entrypoints, vf.qualified)
             if path:
+                # A one-node path means the candidate itself is an entry
+                # point (a public-API function with the same name). That
+                # is a real reachable only when the candidate was
+                # identified at function level (high confidence). A
+                # medium/low text candidate matching a same-named project
+                # attribute is not proof the vulnerable code runs: the
+                # Werkzeug form-parse advisory mentions
+                # Request.max_content_length in its text, and Flask's own
+                # Request.max_content_length property matched it — a
+                # vacuous 1-node "reachable" (19 Nov 2026). Fail closed.
+                if len(path) == 1 and vf.confidence != "high":
+                    results.append(Result(
+                        advisory_id=adv.id, package=adv.package,
+                        vulnerable_function=vf.qualified, verdict="uncertain",
+                        confidence="low", path=[],
+                        reason="Candidate matches a public name but no call "
+                               "path into the vulnerable code was found "
+                               "(single-node match on a medium/low-confidence "
+                               "text candidate).",
+                        function_confidence=vf.confidence,
+                    ))
+                    continue
                 results.append(Result(
                     advisory_id=adv.id, package=adv.package,
                     vulnerable_function=vf.qualified, verdict="reachable",

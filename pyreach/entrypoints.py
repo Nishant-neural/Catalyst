@@ -144,7 +144,12 @@ def find_unsupported_entrypoints(root: str | Path, graph: Graph) -> list[str]:
                 out.append(f"{p.relative_to(root)}: class-based view {cls}.as_view() is unsupported")
     for name, target in _console_scripts(root).items():
         func = target.split(":")[-1].split(".")[-1]
-        mod = target.split(":")[0].rsplit(".", 1)[0] if ":" in target else ""
+        # The part before ":" IS the module ("pkg.mod:func"), not a
+        # qualified function path — do not strip its last segment.
+        # (19 Nov 2026: the old rsplit made prefer_module "yamllint"
+        # for "yamllint.cli:run", which matched two def run and failed
+        # to resolve a real entry point.)
+        mod = target.split(":")[0] if ":" in target else ""
         if not _resolve_simple(graph, func, prefer_module=mod or None):
             out.append(f"console_scripts '{name}' -> '{target}' does not resolve to a project function")
     return out
@@ -162,9 +167,36 @@ def _resolve_simple(graph: Graph, name: str, prefer_module: str | None = None) -
     if not cands:
         return None
     if prefer_module:
-        same = [q for q in cands if q.startswith(prefer_module + ".")]
-        if len(same) == 1:
+        # "Defined in the preferred module" means the qualified name
+        # is exactly <module>.<name>. A startswith check is wrong
+        # here: prefer "kedro.framework.cli" would also match
+        # "kedro.framework.cli.cli.main" AND
+        # "kedro.framework.cli.cli.KedroCLI.main" (two different
+        # functions in a submodule), call that ambiguous, and never
+        # reach the re-export below. Exact equality keeps submodule
+        # functions out of this step entirely.
+        same = [q for q in cands if q == prefer_module + "." + name]
+        if same:
             return same[0]
+        # No definition in the preferred module: the entry may be
+        # re-exported there (cookiecutter's __main__.py does
+        # `from cookiecutter.cli import main`; kedro's cli/__init__.py
+        # does `from .cli import main`). Follow that module's imports
+        # one level — but only to a project function, never an external.
+        # The visitor records a relative import as written
+        # (`from .cli import main` -> "cli.main"), so also try it
+        # joined to the preferred module's package; that join is only
+        # correct for a level-1 relative import, and it only fires
+        # when the joined name is a real project function.
+        for fpath, mod in graph.module_by_file.items():
+            if mod == prefer_module:
+                target = graph.imports_by_file.get(fpath, {}).get(name)
+                if target:
+                    for cand in (target, f"{prefer_module}.{target}"):
+                        if (cand in graph.functions
+                                and graph.functions[cand].file != "external"):
+                            return cand
+        # No re-export found; fall through to the unique-name rule.
     if len(cands) == 1:
         return cands[0]
     return None  # ambiguous: do not guess
@@ -252,7 +284,11 @@ def find_entrypoints_with_evidence(root: str | Path, graph: Graph) -> dict[str, 
     evidence: dict[str, str] = {}
     for name, target in _console_scripts(root).items():
         func = target.split(":")[-1].split(".")[-1]
-        q = _resolve_simple(graph, func)
+        # Same module rule as find_entrypoints: the part before ":"
+        # is the full module — without prefer_module, two `def run`
+        # make this ambiguous and the evidence falls back to generic.
+        mod = target.split(":")[0] if ":" in target else ""
+        q = _resolve_simple(graph, func, prefer_module=mod or None)
         if q:
             evidence[q] = f"console_scripts entry '{name}' -> {target}"
     for q, why in _django_views(root, graph).items():
@@ -297,7 +333,9 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
     # console_scripts: real entries, resolved to qualified functions.
     for _name, target in _console_scripts(root).items():
         func = target.split(":")[-1].split(".")[-1]
-        mod = target.split(":")[0].rsplit(".", 1)[0] if ":" in target else ""
+        # See the same note in find_unsupported_entrypoints: the part
+        # before ":" is the full module, do not strip its last segment.
+        mod = target.split(":")[0] if ":" in target else ""
         q = _resolve_simple(graph, func, prefer_module=mod or None)
         if q:
             entries.add(q)
@@ -362,8 +400,25 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
                 q = _resolve_simple(graph, name)
                 if q:
                     lib_entries.add(q)
+                    continue
+                # A name in __all__ may be a class (Session, Request):
+                # there is no function node for the class itself, but
+                # constructing it is public API use — add its __init__
+                # (19 Nov 2026: requests' __all__ lists Session but
+                # Session.__init__ was never an entry, so the Retry path
+                # from Session construction was invisible).
+                for fn in graph.functions:
+                    if fn.endswith(f".{name}.__init__") and graph.functions[fn].file != "external":
+                        lib_entries.add(fn)
             if lib_entries:
-                return lib_entries, "library: __all__ is the entry surface"
+                # __all__ defines the library surface, but it must not
+                # discard entries found by other means (console scripts,
+                # routes, __main__ guards): kedro's root __all__ has 4
+                # names while its `kedro` console script is how the
+                # tool is actually run, and the early return dropped
+                # it. Merge, don't replace (19 Nov 2026).
+                entries |= lib_entries
+                return entries, "library: __all__ is the entry surface"
         for q in graph.functions:
             # External library functions are NOT entries. Bug found
             # 19 Nov 2026 by scanning real MkDocs: yaml.load, os.path.join

@@ -172,6 +172,26 @@ def parse_unified_diff_both(diff_text: str) -> tuple[dict[str, set[int]], dict[s
     return new_changed, old_changed
 
 
+def _module_from_path(path: str) -> str:
+    """Repo path -> importable module name. Repos often keep code under
+    src/ (jinja2, werkzeug, anyio, urllib3) or lib/ (PyYAML); the
+    installed package has no such prefix, so strip one leading
+    src/lib/lib3 segment — otherwise the candidate's first segment
+    never matches an imported module and the public/internal
+    classification breaks (19 Nov 2026: src.werkzeug.security.safe_join
+    was treated as library-internal even though Flask imports werkzeug,
+    and propagation could not link src.jinja2.* to jinja2.*)."""
+    mod = path.replace("/", ".").removesuffix(".py")
+    for prefix in ("src.", "lib.", "lib3."):
+        if mod.startswith(prefix):
+            mod = mod[len(prefix):]
+            break
+    # pkg/__init__.py is the module pkg, not pkg.__init__.
+    if mod.endswith(".__init__"):
+        mod = mod[: -len(".__init__")]
+    return mod
+
+
 def diff_to_functions(diff_text: str, sources: dict[str, str],
                       commit: str = "", old_sources: dict[str, str] | None = None) -> list[VulnerableFunction]:
     """Map a fix-commit diff to vulnerable functions.
@@ -203,7 +223,7 @@ def diff_to_functions(diff_text: str, sources: dict[str, str],
         src = sources.get(path) or sources.get(path.split("/")[-1], "")
         if not src:
             continue
-        module = path.replace("/", ".").removesuffix(".py")
+        module = _module_from_path(path)
         for qualified, start, end in functions_in_source(src, module):
             hit = [ln for ln in lines if start <= ln <= end]
             if hit:
@@ -220,7 +240,7 @@ def diff_to_functions(diff_text: str, sources: dict[str, str],
             src = old_sources.get(path) or old_sources.get(path.split("/")[-1], "")
             if not src:
                 continue
-            module = path.replace("/", ".").removesuffix(".py")
+            module = _module_from_path(path)
             for qualified, start, end in functions_in_source(src, module):
                 hit = [ln for ln in lines if start <= ln <= end]
                 if hit:

@@ -34,6 +34,7 @@ Phase 2 hardening (built 18 Nov, after the base):
 from __future__ import annotations
 
 import ast
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -85,6 +86,13 @@ class Graph:
     # a dunder method of a module imported by reachable code runs at
     # runtime even though nothing calls the dunder by name.
     module_by_file: dict[str, str] = field(default_factory=dict)
+    # Relative paths of files whose AST parsed successfully. The ledger
+    # used to count "files with at least one function node" instead, so
+    # an empty __init__.py counted as unparsed (19 Nov 2026: yamllint
+    # showed 67/69 with the 2 "unparsed" files just empty __init__.py).
+    # A file with no functions and no top-level calls cannot hide a
+    # call to a vulnerable function, so it counts as parsed.
+    files_parsed: set[str] = field(default_factory=set)
 
 
 class _FileVisitor(ast.NodeVisitor):
@@ -119,6 +127,22 @@ class _FileVisitor(ast.NodeVisitor):
 
     def visit_ImportFrom(self, node):
         mod = node.module or ""
+        if node.level and node.level > 0:
+            # Relative import: resolve against this file's package, the
+            # same way _analyze_imports does. Before this fix (19 Nov
+            # 2026) `from .adapters import HTTPAdapter` in
+            # requests/sessions.py was recorded as "adapters.HTTPAdapter",
+            # so the call never resolved to
+            # src.requests.adapters.HTTPAdapter and the Retry path broke.
+            from pathlib import Path as _Path
+
+            if _Path(self.file).name == "__init__.py":
+                pkg = self.module
+            else:
+                pkg = self.module.rsplit(".", 1)[0] if "." in self.module else self.module
+            for _ in range(node.level - 1):
+                pkg = pkg.rsplit(".", 1)[0] if "." in pkg else ""
+            mod = (pkg + "." + mod) if mod else pkg
         for a in node.names:
             if a.name == "*":
                 if mod:
@@ -288,6 +312,7 @@ def build_graph(root: str | Path) -> Graph:
             tree = ast.parse(src, filename=str(p))
         except (SyntaxError, OSError):
             continue
+        graph.files_parsed.add(str(p.relative_to(root)))
         visitor = _FileVisitor(_module_name(p, root), str(p), graph)
         visitor.visit(tree)
         star_by_file[str(p)] = visitor.star_imports
@@ -395,6 +420,16 @@ def build_graph(root: str | Path) -> Graph:
         if q.endswith(".<module>") and not graph.edges.get(q):
             del graph.functions[q]
             graph.edges.pop(q, None)
+    # Constructor calls: calling a class runs its __init__. Add an edge
+    # from each class to its __init__ so a path through a constructor
+    # call reaches the constructor body (19 Nov 2026: requests builds
+    # a urllib3 Retry inside HTTPAdapter.__init__; without this edge
+    # the path stopped at the HTTPAdapter class node and Retry.__init__
+    # stayed uncertain).
+    for fn in list(graph.functions):
+        if fn.endswith(".__init__"):
+            cls = fn[: -len(".__init__")]
+            graph.edges.setdefault(cls, set()).add(fn)
     _analyze_imports(root, py_files, graph)
     _collect_references(root, py_files, graph)
     return graph
@@ -472,6 +507,12 @@ def _record_import(target: str, rel: str, lineno: int,
             imported.add(prefix)
             return
     if parts[0] in project_tops:
+        # A stdlib module is never an unresolved project import, even
+        # when the repo has a directory of the same name (19 Nov 2026:
+        # ansible-lint has a collections/ fixture dir, so every
+        # `from collections.abc import ...` was flagged unresolved).
+        if parts[0] in getattr(sys, "stdlib_module_names", ()):
+            return
         graph.unresolved_imports.append(
             f"{rel}:{lineno}: cannot resolve import '{target}'")
 

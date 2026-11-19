@@ -2,15 +2,15 @@
 """One-command verification for pyreach, Phases 1-5 + explainer + HTML report.
 
 Usage, from the project root:
-    python3 verify.py            # offline: pytest + 32 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+    python3 verify.py            # offline: pytest + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
     python3 verify.py --live     # also: real OSV fetch for PyYAML 5.3.1 (needs network)
 
 Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (171 tests) — the deterministic core + explainer + HTML report + LLM status
-  B. all 32 fixtures give the expected verdict AND exit code
+  A. the unit suite (189 tests) — the deterministic core + explainer + HTML report + LLM status
+  B. all 35 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
@@ -79,6 +79,16 @@ EXPECTED = {
     "app_unparsed": ("uncertain", 0),          # Critical 5: completeness gate
     "app_mockpatch": ("not_reachable", 0),     # Critical 4: @mock.patch phantom
     "app_dunder": ("uncertain", 0),            # dunder __getattr__ site runs
+    # Evaluation fixes (19 Nov 2026)
+    "app_console_ambig": ("reachable", 2),  # console script pkg.cli:run
+    "app_console_reexport": ("reachable", 2),  # console script via re-export
+    "app_library_all": ("reachable", 2),  # __all__ + console script both entries
+    # Demo fixes (19 Nov 2026): app_same_name is unit-test-only (its
+    # verdict depends on the advisory, not the sample one); app_init_call
+    # does not import yaml, so yaml.load is uncertain (internal rule).
+    "app_init_call": ("uncertain", 0),  # Retry.__init__ reachable (unit test)
+    "app_rel_import": ("uncertain", 0),  # relative import + ctor chain (unit test)
+    "app_all_class": ("uncertain", 0),  # class in __all__ -> __init__ entry (unit test)
 }
 
 passed = failed = 0
@@ -110,7 +120,9 @@ def _have(mod: str) -> bool:
 def _read_report(path: Path):
     """Report JSON or None if the scan never wrote one (crash)."""
     try:
-        return json.loads(path.read_text())
+        # Reports are written UTF-8; on Windows read_text() defaults
+        # to cp1252 and crashes on the em-dashes in reasons (19 Nov 2026).
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
@@ -141,9 +153,9 @@ def main() -> int:
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (171 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (189 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (171 tests)", r.returncode == 0,
+        check("pytest suite (189 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -236,7 +248,7 @@ def main() -> int:
              "--out", str(tmp / "f.json"), "--cache-dir", str(tmp / "cache")])
     longest = max((len(ln) for ln in r.stdout.splitlines()), default=0)
     html_path = tmp / "f.html"
-    page = html_path.read_text() if html_path.exists() else ""
+    page = html_path.read_text(encoding="utf-8") if html_path.exists() else ""
     rep = _read_report(tmp / "f.json")
     check("quiet scan: no line over 500 chars, no evidence dump, HTML written",
           longest < 500 and "entry evidence: {" not in r.stdout
@@ -248,7 +260,7 @@ def main() -> int:
           f"longest={longest} html_exists={html_path.exists()} exit={r.returncode}")
     r = run(["-m", "pyreach.cli", "report", "--report", str(tmp / "f.json"),
              "--out", str(tmp / "f-regen.html")])
-    regen = (tmp / "f-regen.html").read_text() if (tmp / "f-regen.html").exists() else ""
+    regen = (tmp / "f-regen.html").read_text(encoding="utf-8") if (tmp / "f-regen.html").exists() else ""
     check("pyreach report regenerates HTML from an existing report.json",
           r.returncode == 0 and "yaml.load" in regen,
           r.stdout[-200:] + r.stderr[-200:])
@@ -347,7 +359,7 @@ def main() -> int:
                  "--out", str(out)])
         rep = _read_report(out)
         try:
-            advs = rep if isinstance(rep, list) else json.loads(out.read_text())
+            advs = rep if isinstance(rep, list) else json.loads(out.read_text(encoding="utf-8"))
             ids = [a.get("id") for a in advs]
             cands = sum(len(a.get("vulnerable_functions", [])) for a in advs)
         except Exception as e:

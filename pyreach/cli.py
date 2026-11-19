@@ -199,7 +199,7 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
     dep_discovered, dep_parsed = _dependency_coverage(advisories, graph)
     ledger = Ledger(
         project_files_discovered=len(list(root.rglob("*.py"))),
-        project_files_parsed=len({f.file for f in graph.functions.values() if f.file != "external"}),
+        project_files_parsed=len(graph.files_parsed),
         dependency_modules_discovered=dep_discovered,
         dependency_modules_parsed=dep_parsed,
         unresolved_imports=list(graph.unresolved_imports),

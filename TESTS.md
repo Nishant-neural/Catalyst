@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 173 unit tests + 32 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+python verify.py            # offline: 189 unit tests + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,11 +39,11 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 173 tests run with stdlib unittest:
+# if pytest is not installed, the same 189 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 
-Expect: **173 passed**. These cover the call graph, the verifier's 10 rules,
+Expect: **186 passed**. These cover the call graph, the verifier's 10 rules,
 constant propagation, the witness, the debate rule, and the explainer
 (21 tests: citation verifier, evidence-pack caps, all four blocker
 templates, LLM unavailable / rejected / accepted / not-called), plus 8 tests for

@@ -2,10 +2,12 @@
 concat, var-to-var, importlib), the 10-rule verifier, and the
 resolve_getattr_case helper (constants only — no network, no key)."""
 import json
+import os
 import re
 import unittest
 from pathlib import Path
 import sys
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -31,7 +33,7 @@ def _src(fixture: str) -> tuple[str, int]:
     # mention getattr, so a text search would pick the wrong line.
     import ast as _ast
     app = BASE / "fixtures" / fixture / "app.py"
-    src = app.read_text()
+    src = app.read_text(encoding="utf-8")
     tree = _ast.parse(src)
     line = next(n.lineno for n in _ast.walk(tree)
                 if isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
@@ -125,8 +127,15 @@ class TestResolveCase(unittest.TestCase):
         self.assertEqual(out["confidence"], "high")
 
     def test_config_stays_uncertain_without_key(self):
-        src, line = _src("app_getattr_config")
-        out = resolve_getattr_case(src, line, ["yaml.load"], SYMS)
+        # Hermetic: resolve_with_llm falls back to ./.env (resolver.py),
+        # so a real .env in the working directory would make this a live
+        # LLM call that can return a verified verdict. Patch the dotenv
+        # loader at its source module and clear the environment, so
+        # "without key" is actually true on any machine.
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch("pyreach.dotenv.load_dotenv_file", return_value={}):
+            src, line = _src("app_getattr_config")
+            out = resolve_getattr_case(src, line, ["yaml.load"], SYMS)
         self.assertIsNone(out)
 
 

@@ -150,5 +150,25 @@ class TestCachePhase3(unittest.TestCase):
         self.assertEqual(fc.hits, 1)
 
 
+class TestAllClass(unittest.TestCase):
+    def test_class_in_all_adds_init_as_entry(self):
+        # 19 Nov 2026: requests' __all__ lists Session (a class), but
+        # Session.__init__ was never an entry, so the Retry path from
+        # Session construction was invisible. A class in __all__ is
+        # public API: constructing it must be an entry.
+        root = Path(__file__).resolve().parent.parent / "fixtures" / "app_all_class"
+        graph = build_graph(root)
+        entries, note = find_entrypoints(root, graph)
+        self.assertIn("pkg.widgets.Widget.__init__", entries)
+        self.assertEqual(note, "library: __all__ is the entry surface")
+
+    def test_non_exported_helper_is_not_an_entry(self):
+        root = Path(__file__).resolve().parent.parent / "fixtures" / "app_all_class"
+        graph = build_graph(root)
+        entries, _ = find_entrypoints(root, graph)
+        self.assertNotIn("pkg.widgets.helper", entries)
+        self.assertNotIn("pkg.widgets.Widget.run", entries)
+
+
 if __name__ == "__main__":
     unittest.main()

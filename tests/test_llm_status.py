@@ -315,8 +315,14 @@ class TestLlmTestCommand(unittest.TestCase):
         return code, buf.getvalue()
 
     def test_no_key_exit_1_names_the_kind_and_prints_no_key(self):
+        # Hermetic: the resolver imports load_dotenv_file at call time
+        # from pyreach.dotenv (resolver.py), so patching only
+        # pyreach.cli's binding leaves the resolver's .env fallback
+        # live — on a machine with a real .env in cwd this test made a
+        # real network call and passed. Patch the loader at its source.
         with mock.patch.dict(os.environ, {}, clear=True), \
-                mock.patch("pyreach.cli.load_dotenv_file", return_value={}):
+                mock.patch("pyreach.cli.load_dotenv_file", return_value={}), \
+                mock.patch("pyreach.dotenv.load_dotenv_file", return_value={}):
             code, out = self._run(["llm-test"])
         self.assertEqual(code, 1)
         self.assertIn("no_key", out)

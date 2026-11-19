@@ -1,0 +1,1 @@
+[{"fix_commit":"example-sha","fixed_version":"5.4","id":"OSV-2020-1234","package":"pyyaml","summary":"yaml.load() allows arbitrary code execution","vulnerable_functions":[{"confidence":"high","evidence":"fix commit","file":"yaml/__init__.py","qualified":"yaml.load"}],"vulnerable_versions":"<5.4"}]
