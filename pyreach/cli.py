@@ -137,12 +137,18 @@ def resolve_model_choice(explicit_model: str | None) -> tuple[str, bool]:
 
 def _dependency_coverage(advisories, graph) -> tuple[int, int]:
     """Modules discovered vs parsed for the vulnerable dependencies
-    (ChatGPT §5, 19 Nov 2026). Discovered: .py files under the installed
-    package, found via the import names the advisories' candidates use
-    (yaml.load -> yaml). Parsed: 0 — pyreach does not parse dependency
-    source yet, and the ledger must say so honestly instead of 0/0. The
-    internal-target rule in reach.py is what keeps those candidates
-    uncertain until dependency source is parsed."""
+    (ChatGPT §5, 19 Nov 2026). With --with-deps (Phase 11) the counts
+    are real: the dependency graphs merged into this graph recorded
+    their own discovered/parsed numbers. Without it, discovered comes
+    from the installed package (find_spec) and parsed is 0 — pyreach
+    does not parse dependency source yet, and the ledger must say so
+    honestly instead of 0/0. The internal-target rule in reach.py is
+    what keeps those candidates uncertain until dependency source is
+    parsed."""
+    if getattr(graph, "dependency_coverage", None):
+        discovered = sum(v[0] for v in graph.dependency_coverage.values())
+        parsed = sum(v[1] for v in graph.dependency_coverage.values())
+        return discovered, parsed
     discovered = 0
     seen: set[str] = set()
     for adv in advisories:
@@ -169,6 +175,53 @@ def _dependency_coverage(advisories, graph) -> tuple[int, int]:
     return discovered, 0
 
 
+def _parse_dependencies(graph, advisories, cache, args, packages=None):
+    """--with-deps (Phase 11, 19 Nov 2026): for each advisory package
+    pinned to an exact version, download its sdist from PyPI and merge
+    its call graph into the project graph (depsource.py). Versions come
+    from the scan-all package table first, then --package/--version for
+    a single scan. A package with no exact version, no sdist, or no
+    network is left unparsed and the reason is printed — its candidates
+    stay uncertain exactly as before, never silently assumed clean.
+    Runs before find_entrypoints, so merged dependency functions are
+    excluded from entry points."""
+    from .depsource import import_names_for_advisory, merge_dependency, parse_dependency
+    versions: dict[str, str] = {}
+    if packages:
+        # scan-all passes a list of dicts ({name, version, status});
+        # keep objects working too (Dependency has the same fields).
+        for dep in packages:
+            if isinstance(dep, dict):
+                ver, status, name = (dep.get("version"), dep.get("status"),
+                                     dep.get("name"))
+            else:
+                ver = getattr(dep, "version", None)
+                status = getattr(dep, "status", None)
+                name = getattr(dep, "name", None)
+            if ver and status != "skipped" and name:
+                versions[normalize_name(name)] = ver
+    if getattr(args, "package", None) and getattr(args, "version", None):
+        versions.setdefault(normalize_name(args.package), args.version)
+    seen: set[str] = set()
+    for adv in advisories:
+        pkg = normalize_name(adv.package)
+        if pkg in seen or not adv.vulnerable_functions:
+            continue
+        seen.add(pkg)
+        version = versions.get(pkg)
+        if not version:
+            print(f"dependency: {adv.package} — no exact version, source not parsed (internals stay uncertain)")
+            continue
+        names = import_names_for_advisory(adv)
+        parsed = parse_dependency(adv.package, version, names, cache.dir)
+        if parsed is None:
+            print(f"dependency: {adv.package} {version} — source unavailable (no sdist or no network), internals stay uncertain")
+            continue
+        dep_graph, discovered, parsed_n, import_name = parsed
+        merge_dependency(graph, dep_graph, import_name, discovered, parsed_n)
+        print(f"dependency: {adv.package} {version} — parsed {parsed_n}/{discovered} modules ({import_name})")
+
+
 def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
               args, packages=None):
     """Phases 2-5 + explainer + report for one advisory list.
@@ -183,6 +236,8 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
     written). Returns (report_dict, exit_code).
     """
     graph = build_graph(root)
+    if getattr(args, "with_deps", False) and cache is not None:
+        _parse_dependencies(graph, advisories, cache, args, packages)
     entries, entry_note = find_entrypoints(root, graph)
     # Quiet by default: the terminal is a summary, not a dump. A full
     # entry-point list on a real project is 1,194 names on one line
@@ -594,7 +649,8 @@ def _cmd_scan_all(sargs) -> int:
             out=sargs.out, vex=sargs.vex, with_proof=sargs.with_proof,
             explain=sargs.explain, verbose=sargs.verbose,
             no_html=sargs.no_html, llm_debug=sargs.llm_debug,
-            proof_timeout=sargs.proof_timeout, print_prompt=False)
+            proof_timeout=sargs.proof_timeout, print_prompt=False,
+            with_deps=sargs.with_deps)
         report, code = _run_scan(root, all_advisories, cache, use_llm, model,
                                  allow_fallback, scan_args, packages=packages)
     print("\nscan-all packages:")
@@ -806,6 +862,7 @@ def main(argv=None) -> int:
         sp.add_argument("--with-llm", action="store_true")
         sp.add_argument("--no-llm", action="store_true")
         sp.add_argument("--model", default=None)
+        sp.add_argument("--with-deps", action="store_true", help="Download each advisory package's source from PyPI and parse it, so library-internal functions can be proven reachable or not-reachable (default: dependency source is not parsed and internals stay uncertain)")
         sp.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
         sp.add_argument("--explain", action="store_true")
         sp.add_argument("--verbose", action="store_true")
@@ -828,6 +885,7 @@ def main(argv=None) -> int:
     p.add_argument("--with-llm", action="store_true", help="Run LLM resolver on uncertain cases (also auto-enabled when a key is in .env / the environment)")
     p.add_argument("--no-llm", action="store_true", help="Never run the LLM resolver, even if a key is in .env / the environment")
     p.add_argument("--model", default=None, help="LLM model for the resolver (default: cohere/north-mini-code:free; explicit --model is used exactly, with no fallback)")
+    p.add_argument("--with-deps", action="store_true", help="Download each advisory package's source from PyPI and parse it, so library-internal functions can be proven reachable or not-reachable (default: dependency source is not parsed and internals stay uncertain)")
     p.add_argument("--print-prompt", action="store_true", help="Print the grounded LLM prompt for uncertain cases and exit without calling any model (demo without a key)")
     p.add_argument("--with-proof", action="store_true", help="Run execution proof for reachable cases")
     p.add_argument("--explain", action="store_true",

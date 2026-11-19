@@ -252,6 +252,13 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
     results: list[Result] = []
     dynamic_near = _has_dynamic_near(graph, entrypoints)
     for adv in advisories:
+        # Which of this advisory's import names had their source parsed
+        # (Phase 11): used below to say plainly when a candidate was
+        # not found in parsed source, instead of claiming the source
+        # was never parsed.
+        parsed_imports = ({vf.qualified.split(".")[0]
+                           for vf in adv.vulnerable_functions}
+                          & graph.dependency_parsed_modules)
         if not adv.vulnerable_functions:
             results.append(Result(
                 advisory_id=adv.id, package=adv.package,
@@ -298,14 +305,23 @@ def analyze(advisories: list[Advisory], graph: Graph, entrypoints: set[str]) -> 
             # never calls directly: we cannot prove not_reachable, because
             # the dependency source was not parsed and the library may call
             # it internally when a public API is used. Fail closed -> uncertain.
+            # When the advisory's package WAS parsed and this name is not
+            # in it, say so: the name may be a text artefact from the fix
+            # commit (e.g. huntr.com, scraped from a commit message).
             if _is_library_internal(vf.qualified, graph) and not _target_in_graph(graph, vf.qualified):
+                if parsed_imports:
+                    reason = ("Library-internal function, not found in the parsed "
+                              f"{', '.join(sorted(parsed_imports))} source; "
+                              "cannot prove not-reachable from a name that may "
+                              "be a text artefact rather than a real function.")
+                else:
+                    reason = ("Library-internal function, dependency source not parsed; "
+                              "cannot prove not-reachable. Reachable if a public loader "
+                              "that uses it is reachable (see propagate_library_internals).")
                 results.append(Result(
                     advisory_id=adv.id, package=adv.package,
                     vulnerable_function=vf.qualified, verdict="uncertain",
-                    confidence="medium", path=[],
-                    reason="Library-internal function, dependency source not parsed; "
-                           "cannot prove not-reachable. Reachable if a public loader "
-                           "that uses it is reachable (see propagate_library_internals).",
+                    confidence="medium", path=[], reason=reason,
                     function_confidence=vf.confidence,
                 ))
                 continue

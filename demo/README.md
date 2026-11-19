@@ -93,3 +93,30 @@ vulnerabilities in real code, not a synthetic fixture.
    mean the second run of the demo is fast: the fix-commit diffs are
    cached by (repo, sha) and the LLM answers (when used) by
    (model, prompt hash). The demo's full run takes ~10 seconds.
+
+## `--with-deps`: parsing the dependency's own source (Phase 11)
+
+The demo above runs WITHOUT dependency parsing: the tool reads the
+project's code but never opens Jinja2's or Werkzeug's code, so
+library-internal candidates stay uncertain by design. `--with-deps`
+changes that: for each pinned advisory package it downloads the sdist
+from PyPI (cached under `.reachcache/deps/`) and merges its call graph
+into the project's, so an internal function can be proven reachable
+or not-reachable.
+
+Proven on ONE project only so far (19 Nov 2026, limited scope):
+requests, same 2023 pins, same advisory files, `--with-deps` added
+(~7 s, sdists cached after the first run). idna 8/8 + urllib3 39/39
+parsed, dependency 47/47. Verdicts unchanged — 1 reachable
+(Retry.__init__, same path), 2 uncertain — but the reasons are now
+grounded: huntr.com is "not found in the parsed idna source", and
+idna.encode is uncertain because a reachable dynamic trigger may hide
+a path (the path breaks at `poolmanager.urlopen`, an attribute call on
+an object of unknown type). Report:
+`~/workspace/real-projects-pyreach/requests-demo-deps.json` (+ .html).
+
+One honest limit it exposed: `yaml.safe_load` calls `load(stream,
+SafeLoader)`, so with the dep parsed, yaml.load reads reachable in an
+app that only uses safe_load — the tool cannot yet tell Loader
+arguments apart. Loader-aware verdicts are follow-up work, not in
+this demo.

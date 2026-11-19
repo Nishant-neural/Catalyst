@@ -34,6 +34,10 @@ pyreach scan-all fixtures/app_scanall --advisory-dir fixtures/app_scanall_adviso
 # Live (needs network): reads deps from pyproject.toml / requirements.txt
 # / lockfiles, resolves each to an exact version, fetches OSV per package:
 pyreach scan-all <project> --no-llm --out report.json
+# Phase 11, dependency source (needs network the first run: PyPI sdists,
+# cached under .reachcache/deps/): library internals can then be proven
+# reachable or not-reachable instead of staying uncertain:
+pyreach scan-all <project> --no-llm --with-deps --out report.json
 
 python -m pytest tests/ -q
 ```

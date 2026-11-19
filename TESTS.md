@@ -3,7 +3,7 @@
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 189 unit tests + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+python verify.py            # offline: 202 unit tests + 38 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 

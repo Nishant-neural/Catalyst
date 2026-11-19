@@ -9,8 +9,8 @@ Every check prints PASS or FAIL with what it expected and what it got.
 Exit code 0 only if every check passes. No API key needed for any check.
 
 What it proves, in order:
-  A. the unit suite (189 tests) — the deterministic core + explainer + HTML report + LLM status
-  B. all 35 fixtures give the expected verdict AND exit code
+  A. the unit suite (202 tests) — the deterministic core + explainer + HTML report + LLM status
+  B. all 38 fixtures give the expected verdict AND exit code
      (exit 2 = reachable, exit 0 = not_reachable / uncertain)
   C. --print-prompt works with no key (Phase 4 demo)
   D. --with-proof witnesses a real path, keeps a wrapper's middle,
@@ -32,6 +32,12 @@ What it proves, in order:
      still gets exactly one statement
   G. (--live) the real OSV -> fix-commit -> candidates pipeline
      for PyYAML 5.3.1, the case Phase 1 was built on (runs last)
+  K. (--live) Phase 11 --with-deps on app_safe with the real PyYAML
+     5.3.1 advisory: the dependency source parses (17/17) and the
+     internal candidates clear to not_reachable for the first time.
+     yaml.load still reads reachable — it is called by safe_load, and
+     the tool cannot yet tell Loader arguments apart (known limit,
+     see PHASES.md Phase 11), so that verdict is asserted as-is.
 """
 from __future__ import annotations
 
@@ -153,9 +159,9 @@ def main() -> int:
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (189 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (202 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (189 tests)", r.returncode == 0,
+        check("pytest suite (202 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")
@@ -367,6 +373,35 @@ def main() -> int:
         check("PyYAML 5.3.1 -> GHSA-8q59-q68h-6hv4, >=1 candidate",
               "GHSA-8q59-q68h-6hv4" in ids and isinstance(cands, int) and cands >= 1,
               f"ids={ids} candidates={cands}")
+
+    if live:
+        print("K. live --with-deps on app_safe (network: PyPI sdist)")
+        out = tmp / "safe-deps.json"
+        r = run(["-m", "pyreach.cli", "scan", "fixtures/app_safe",
+                 "--package", "PyYAML", "--version", "5.3.1",
+                 "--no-llm", "--no-html", "--with-deps",
+                 "--out", str(out), "--vex", str(tmp / "safe-deps-vex.json"),
+                 "--cache-dir", str(tmp / "cache")])
+        rep = _read_report(out)
+        if rep is None:
+            err = (r.stderr.strip() or r.stdout.strip()).splitlines()
+            check("app_safe --with-deps: report written",
+                  False, f"<scan crashed, exit={r.returncode}: {err[-1] if err else 'no output'}>")
+        else:
+            by_fn = {x["vulnerable_function"]: x["verdict"]
+                     for x in rep.get("results", [])}
+            dep = (rep.get("completeness_ledger") or {}).get(
+                "dependency_source", "")
+            check("app_safe --with-deps: yaml source parsed 17/17",
+                  dep == "17/17 parsed", f"dependency_source={dep}")
+            check("app_safe --with-deps: full_load + yaml.full_load not_reachable",
+                  by_fn.get("full_load") == "not_reachable"
+                  and by_fn.get("yaml.full_load") == "not_reachable",
+                  f"verdicts={by_fn}")
+            check("app_safe --with-deps: yaml.load reachable via safe_load "
+                  "(Loader args not distinguished — known limit)",
+                  by_fn.get("yaml.load") == "reachable",
+                  f"verdicts={by_fn}")
 
     print(f"\n{passed} passed, {failed} failed")
     return 0 if failed == 0 else 1

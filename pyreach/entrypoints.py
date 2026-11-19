@@ -163,7 +163,8 @@ def _resolve_simple(graph: Graph, name: str, prefer_module: str | None = None) -
     must resolve to a project function, not to the library it calls."""
     cands = [q for q in graph.functions
              if q.split(".")[-1] == name
-             and graph.functions[q].file != "external"]
+             and graph.functions[q].file != "external"
+             and graph.functions[q].file not in graph.dependency_files]
     if not cands:
         return None
     if prefer_module:
@@ -194,7 +195,9 @@ def _resolve_simple(graph: Graph, name: str, prefer_module: str | None = None) -
                 if target:
                     for cand in (target, f"{prefer_module}.{target}"):
                         if (cand in graph.functions
-                                and graph.functions[cand].file != "external"):
+                                and graph.functions[cand].file != "external"
+                                and graph.functions[cand].file
+                                not in graph.dependency_files):
                             return cand
         # No re-export found; fall through to the unique-name rule.
     if len(cands) == 1:
@@ -408,7 +411,7 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
                 # Session.__init__ was never an entry, so the Retry path
                 # from Session construction was invisible).
                 for fn in graph.functions:
-                    if fn.endswith(f".{name}.__init__") and graph.functions[fn].file != "external":
+                    if fn.endswith(f".{name}.__init__") and graph.functions[fn].file != "external" and graph.functions[fn].file not in graph.dependency_files:
                         lib_entries.add(fn)
             if lib_entries:
                 # __all__ defines the library surface, but it must not
@@ -426,7 +429,12 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
             # so BFS found yaml.load as its own entry with path
             # ["yaml.load"] — a reachable verdict with no real evidence
             # chain. An entry point must be project code that runs.
+            # Merged dependency functions (Phase 11) are real code but
+            # still not project entries: the dependency runs only when
+            # project code calls into it.
             if graph.functions[q].file == "external":
+                continue
+            if graph.functions[q].file in graph.dependency_files:
                 continue
             if not q.split(".")[-1].startswith("_"):
                 # Only if module is public (not _private)
@@ -436,9 +444,11 @@ def find_entrypoints(root: str | Path, graph: Graph) -> tuple[set[str], str]:
         return entries, "library: public API is the entry surface"
     if not entries:
         # Fallback: public functions only, low confidence — project
-        # functions only, never external library nodes (same bug).
+        # functions only, never external library nodes (same bug) and
+        # never merged dependency functions (Phase 11).
         entries = {q for q in graph.functions
                    if not q.split(".")[-1].startswith("_")
-                   and graph.functions[q].file != "external"}
+                   and graph.functions[q].file != "external"
+                   and graph.functions[q].file not in graph.dependency_files}
         return entries, "fallback: no main/route found, used public functions only"
     return entries, f"app: {len(entries)} entry point(s)"

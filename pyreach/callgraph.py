@@ -93,6 +93,17 @@ class Graph:
     # A file with no functions and no top-level calls cannot hide a
     # call to a vulnerable function, so it counts as parsed.
     files_parsed: set[str] = field(default_factory=set)
+    # Phase 11 (19 Nov 2026): dependency source parsed with --with-deps.
+    # Files of merged dependency graphs (same path form as
+    # module_by_file keys) — their functions are real code but must
+    # never become entry points, and they do not count toward the
+    # project's parsed-file ledger.
+    dependency_files: set[str] = field(default_factory=set)
+    # Top-level modules whose source was parsed (jinja2, yaml, ...).
+    dependency_parsed_modules: set[str] = field(default_factory=set)
+    # import name -> (.py files discovered, .py files parsed) under the
+    # dependency's package dir. The ledger sums these when present.
+    dependency_coverage: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 class _FileVisitor(ast.NodeVisitor):

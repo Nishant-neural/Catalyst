@@ -1157,3 +1157,88 @@ at 19 Nov 2026 ~11:10 IST); the demo uses `--only` runtime deps +
 pre-seeded advisory files to avoid that. Two advisories were dropped
 from the demo set (no fix commit in OSV → no identifiable function:
 GHSA-qccp-gfcp-xxvc, GHSA-65pc-fj4g-8rjx). See `demo/README.md`.
+
+## Phase 11 — dependency-source parsing, `--with-deps` (19 Nov 2026)
+
+The answer to "why don't we parse dependency source yet": until now
+the tool deliberately treated dependency internals as unknown
+(fail-closed), because parsing them is real work — sdist layouts
+differ per package, the graphs have to merge without polluting entry
+points, and the reference rule had to stay about project code. Now
+built, behind `--with-deps` (opt-in; default behaviour unchanged).
+
+New module `pyreach/depsource.py`: for each advisory package pinned
+to an exact version, download its sdist from PyPI (cached under
+`<cache-dir>/deps/<pkg>-<version>/`, sha256-verified, never
+re-downloaded), find the top-level package inside it (`find_package_root`:
+src/ layout, lib/ vs lib3/ — lib3 wins, PyYAML ships both — flat
+layout, single .py module, `top_level.txt` fallback; the import name
+comes from the advisory candidates' first segment, because the PyPI
+name alone is not enough — PyYAML imports as yaml), build the same
+AST call graph over it, and merge it into the project graph
+(`merge_dependency`). Merge rules: a real project function always
+wins a name collision; an external placeholder node
+(file="external", e.g. yaml.load as called by project code) LOSES to
+the real dependency function, which is what lets BFS continue into
+the dependency body; edges/ambiguous calls merge only for callers
+that are not real project functions; re-export aliases are linked
+(`fakepkg.public_api` -> `fakepkg.core.public_api`, from the top-level
+`__init__` imports — star re-exports have no per-name record and are
+missed, fail-closed); dependency references are deliberately NOT
+merged (see below); dependency files are recorded in
+`graph.dependency_files` so entrypoints.py never makes them entries,
+and `graph.dependency_coverage` carries real discovered/parsed
+counts for the ledger. `analyze()` needed no change for the main
+path: a merged dep function IS in the graph, so the internal-uncertain
+branch (which requires the target to be absent) is skipped and BFS
+decides. `propagate_library_internals` is a no-op for parsed deps
+for the same reason. `derive_blocker` step 4 excludes dep files from
+the parsed count, or unparsed project files would never trigger it.
+
+Bugs found by the first live runs and fixed in the same build:
+1. scan-all passes `packages` as dicts, not Dependency objects —
+   `_parse_dependencies` read `.version` via getattr and got None, so
+   it printed "no exact version" for every package. Now reads both.
+2. Merging dep references made every dep-internal cross-reference
+   fire the reference rule (idna's own code mentioning idna.encode
+   blocked not_reachable). The rule is about PROJECT code handing a
+   target to something; dep-internal references are already covered
+   by the merged graph's own dynamic / unresolved-attr sites, so
+   `referenced_dotted` / `referenced_names` are no longer merged.
+3. The internal-branch reason said "dependency source not parsed"
+   even when the advisory's package WAS parsed and the name simply
+   isn't in it (huntr.com, a junk text candidate from a fix-commit
+   message). Now says "not found in the parsed <module> source".
+
+Tested on ONE small project only, per scope (19 Nov 2026):
+requests, 2023 pins, scan-all --with-deps (~7 s, sdists cached
+after the first run). idna 8/8 + urllib3 39/39 parsed, dependency
+47/47. Verdicts UNCHANGED from the no-deps run — 1 reachable
+(Retry.__init__, same path), 2 uncertain — but the reasons are now
+grounded: huntr.com is "not found in the parsed idna source", and
+idna.encode is uncertain because a reachable dynamic trigger may hide
+a path (the path itself breaks at `poolmanager.urlopen`, an attribute
+call on an object of unknown type — no variable type inference, the
+standing blind spot). Report:
+`~/workspace/real-projects-pyreach/requests-demo-deps.json` (+ .html).
+
+The same flag on app_safe with the real PyYAML 5.3.1 advisory
+(verify.py section K, --live): yaml 17/17 parsed, 6/7 not_reachable
+for the first time on a real advisory (constructors, FullLoader,
+full_load, yaml.full_load), uncertain rate 0%.
+
+Honest limits this feature EXPOSED (not fixed here):
+- Loader arguments are not distinguished. `yaml.safe_load` calls
+  `load(stream, SafeLoader)`, so with the dep parsed yaml.load reads
+  reachable in an app that only uses safe_load. Function-level
+  reachability cannot tell them apart; Loader-aware verdicts are the
+  follow-up. This is asserted as-is in verify.py section K.
+- The VEX gate (`is_complete_for_not_reachable`) is global: it
+  requires 0 ambiguous edges anywhere, and PyYAML alone contributes
+  64 (same simple names across its modules), so on a --with-deps run
+  it essentially never passes. Per-advisory scoping is follow-up
+  work. (In the app_safe run VEX is 0 anyway: yaml.load is reachable,
+  so aggregation blocks it regardless.)
+- Star re-exports in a dependency's `__init__` are not linked.
+- A dependency with no sdist, no network, or no exact version stays
+  unparsed and its candidates stay uncertain, as before.

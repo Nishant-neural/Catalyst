@@ -174,10 +174,13 @@ def derive_blocker(result, graph, root: Path, entries: set[str]) -> str:
         site = {"caller": caller, "file": info.file if info else ""}
         if site_can_run(graph, entries, reachable, modules, site):
             return "ambiguous_name"
-    # 4. Unparsed files leave holes in the graph.
+    # 4. Unparsed files leave holes in the graph. Dependency files
+    # (Phase 11) are excluded from the count: they are parsed, just not
+    # project files, and counting them here hid unparsed project files.
     discovered = len(list(root.rglob("*.py")))
     parsed = len({f.file for f in graph.functions.values()
-                  if f.file != "external"})
+                  if f.file != "external"
+                  and f.file not in graph.dependency_files})
     if discovered > parsed:
         return "unparsed_file"
     # Fallbacks, in the same order, without the reachability filter:
