@@ -1,0 +1,5 @@
+# httpx runtime deps, pinned to 2023 versions.
+certifi==2023.7.22
+httpcore==0.18.0
+anyio==3.7.1
+idna==3.4

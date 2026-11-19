@@ -9,6 +9,9 @@ description = "Which vulnerability alerts actually affect a Python project? Dete
 requires-python = ">=3.11"
 dependencies = ["requests>=2.31"]
 
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn[standard]>=0.27", "pyyaml>=6.0"]
+
 [project.scripts]
 pyreach = "pyreach.cli:main"
 

@@ -1,0 +1,121 @@
+[
+  {
+    "id": "GHSA-8q59-q68h-6hv4",
+    "package": "PyYAML",
+    "fixed_version": "5.4",
+    "references": [
+      "https://nvd.nist.gov/vuln/detail/CVE-2020-14343",
+      "https://github.com/SeldonIO/seldon-core/issues/2252",
+      "https://github.com/yaml/pyyaml/issues/420",
+      "https://github.com/yaml/pyyaml/issues/420#issuecomment-663673966",
+      "https://github.com/yaml/pyyaml/commit/a001f2782501ad2d24986959f0239a354675f9dc",
+      "https://bugzilla.redhat.com/show_bug.cgi?id=1860466",
+      "https://github.com/advisories/GHSA-8q59-q68h-6hv4",
+      "https://github.com/pypa/advisory-database/tree/main/vulns/pyyaml/PYSEC-2021-142.yaml",
+      "https://github.com/yaml/pyyaml",
+      "https://pypi.org/project/PyYAML",
+      "https://www.oracle.com/security-alerts/cpuapr2022.html",
+      "https://www.oracle.com/security-alerts/cpujul2022.html"
+    ],
+    "summary": "Improper Input Validation in PyYAML | A vulnerability was discovered in the PyYAML library in versions before 5.4, where it is susceptible to arbitrary code execution when it processes untrusted YAML files through the full_load method or with the FullLoader loader. Applications that use the library to process untrusted input may be vulnerable to this flaw. This flaw allows an attacker to execute arbitrary code on the system by abusing the python/object/new constructor. This flaw is due to an incomplete fix for CVE-2020-1747.",
+    "fix_commit": {
+      "repo": "yaml/pyyaml",
+      "sha": "a001f2782501ad2d24986959f0239a354675f9dc"
+    },
+    "candidates": [
+      {
+        "qualified": "FullConstructor.construct_python_module",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_module"
+      },
+      {
+        "qualified": "FullConstructor.construct_python_object",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_object"
+      },
+      {
+        "qualified": "FullConstructor.construct_python_object_new",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_object_new"
+      },
+      {
+        "qualified": "FullLoader",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions FullLoader"
+      },
+      {
+        "qualified": "full_load",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions full_load"
+      },
+      {
+        "qualified": "yaml.load",
+        "file": "test-diff",
+        "confidence": "medium",
+        "evidence": "test changed away from yaml.load"
+      },
+      {
+        "qualified": "yaml.full_load",
+        "file": "test-diff",
+        "confidence": "medium",
+        "evidence": "test changed away from yaml.full_load"
+      }
+    ],
+    "diff_files": [
+      "lib/yaml/constructor.py",
+      "lib3/yaml/constructor.py",
+      "tests/lib/test_recursive.py",
+      "tests/lib3/test_recursive.py"
+    ],
+    "diff_lines": 110,
+    "vulnerable_functions": [
+      {
+        "qualified": "FullConstructor.construct_python_module",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_module"
+      },
+      {
+        "qualified": "FullConstructor.construct_python_object",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_object"
+      },
+      {
+        "qualified": "FullConstructor.construct_python_object_new",
+        "file": "diff",
+        "confidence": "medium",
+        "evidence": "module-level fix touches FullConstructor.construct_python_object_new"
+      },
+      {
+        "qualified": "FullLoader",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions FullLoader"
+      },
+      {
+        "qualified": "full_load",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions full_load"
+      },
+      {
+        "qualified": "yaml.load",
+        "file": "test-diff",
+        "confidence": "medium",
+        "evidence": "test changed away from yaml.load"
+      },
+      {
+        "qualified": "yaml.full_load",
+        "file": "test-diff",
+        "confidence": "medium",
+        "evidence": "test changed away from yaml.full_load"
+      }
+    ]
+  }
+]

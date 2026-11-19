@@ -1,0 +1,298 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=Silkscreen:wght@400;700&display=swap');
+
+:root {
+  --green: #00c853;
+  --green-dark: #00963e;
+  --green-glow: #00ff66;
+  --black: #0a0a0a;
+  --paper: #f3f7f3;
+  --white: #ffffff;
+  --red: #e60023;
+  --amber: #d97706;
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0px !important;
+}
+
+body {
+  margin: 0;
+  background-color: var(--paper);
+  color: var(--black);
+  font-family: 'JetBrains Mono', monospace;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Graph-paper background */
+.bg-graph-paper {
+  min-height: 100vh;
+  background-color: var(--paper);
+  background-image:
+    linear-gradient(to right, rgba(0, 200, 83, 0.12) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(0, 200, 83, 0.12) 1px, transparent 1px);
+  background-size: 24px 24px;
+}
+
+.bg-dither-cobalt {
+  background-image: radial-gradient(var(--green) 1.5px, transparent 1.5px);
+  background-size: 7px 7px;
+}
+
+/* Typography */
+.font-pixel {
+  font-family: 'Silkscreen', monospace !important;
+  letter-spacing: 0.03em;
+}
+
+h1 {
+  font-family: 'Silkscreen', monospace;
+  font-size: 2.2rem;
+  margin: 0.25rem 0;
+  text-shadow: 3px 3px 0px var(--green);
+}
+
+h2 {
+  font-family: 'Silkscreen', monospace;
+  font-size: 0.95rem;
+  margin: 0;
+}
+
+code, pre {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Header */
+header {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+  background: var(--white);
+  border-bottom: 3px solid var(--black);
+}
+
+header > div {
+  max-width: 1040px;
+  margin: 0 auto;
+  padding: 0.75rem 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+header nav {
+  display: flex;
+  border: 2px solid var(--black);
+  background: var(--white);
+  box-shadow: 3px 3px 0px var(--black);
+}
+
+header nav button {
+  border: none;
+  border-right: 2px solid var(--black);
+  box-shadow: none;
+  padding: 0.5rem 1rem;
+  background: var(--white);
+  color: var(--black);
+}
+
+header nav button:last-child {
+  border-right: none;
+}
+
+header nav button.bg-black {
+  background: var(--black) !important;
+  color: var(--green-glow) !important;
+}
+
+/* Main Container */
+main {
+  max-width: 1040px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 1.5rem 1.25rem 3rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1.5rem;
+}
+
+/* Pixel Cards & Sections */
+section.bg-white,
+div.bg-white {
+  background: var(--white);
+  border: 2px solid var(--black);
+  box-shadow: 5px 5px 0px var(--black);
+  padding: 1.25rem;
+}
+
+section.relative {
+  position: relative;
+  overflow: hidden;
+  border-left: 8px solid var(--green);
+}
+
+/* Buttons */
+button {
+  font-family: 'Silkscreen', monospace;
+  font-size: 0.75rem;
+  cursor: pointer;
+  padding: 0.55rem 1rem;
+  border: 2px solid var(--black);
+  background: var(--white);
+  color: var(--black);
+  box-shadow: 3px 3px 0px var(--black);
+  transition: transform 0.08s ease, box-shadow 0.08s ease;
+}
+
+button:hover:not(:disabled) {
+  transform: translate(1px, 1px);
+  box-shadow: 2px 2px 0px var(--black);
+}
+
+button:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: none;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Primary Green CTA Buttons */
+button.bg-cobalt,
+.bg-cobalt {
+  background: var(--green) !important;
+  color: var(--black) !important;
+  font-weight: 700;
+}
+
+button.bg-cobalt:hover:not(:disabled) {
+  background: var(--green-glow) !important;
+}
+
+/* Inputs & Selects */
+input[type='text'],
+input[type='number'],
+select {
+  width: 100%;
+  padding: 0.55rem 0.7rem;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  background: var(--paper);
+  color: var(--black);
+  border: 2px solid var(--black);
+  outline: none;
+}
+
+input[type='text']:focus,
+input[type='number']:focus,
+select:focus {
+  background: var(--white);
+  border-color: var(--green);
+  box-shadow: 3px 3px 0px var(--green);
+}
+
+input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--green);
+  cursor: pointer;
+}
+
+/* File Upload Button */
+label.cursor-pointer {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.4rem 0.75rem;
+  background: var(--black);
+  color: var(--green-glow);
+  border: 2px solid var(--black);
+  font-family: 'Silkscreen', monospace;
+  font-size: 0.7rem;
+  cursor: pointer;
+  box-shadow: 3px 3px 0px var(--green);
+}
+
+.hidden {
+  display: none !important;
+}
+
+/* Layout Helpers */
+.flex { display: flex; }
+.flex-col { flex-direction: column; }
+.flex-wrap { flex-wrap: wrap; }
+.items-center { align-items: center; }
+.items-end { align-items: flex-end; }
+.justify-between { justify-content: space-between; }
+.gap-2 { gap: 0.5rem; }
+.gap-3 { gap: 0.75rem; }
+.gap-4 { gap: 1rem; }
+.space-y-3 > * + * { margin-top: 0.75rem; }
+.space-y-4 > * + * { margin-top: 1rem; }
+.w-full { width: 100%; }
+.block { display: block; }
+.mb-1 { margin-bottom: 0.35rem; }
+.mt-1 { margin-top: 0.35rem; }
+.pb-2 { padding-bottom: 0.6rem; }
+.border-b-2 { border-bottom: 2px solid var(--black); }
+
+/* Responsive Grids */
+.grid {
+  display: grid;
+  gap: 1rem;
+}
+
+.grid-cols-1 { grid-template-columns: 1fr; }
+.grid-cols-2 { grid-template-columns: repeat(2, 1fr); }
+
+@media (min-width: 768px) {
+  .md\:grid-cols-2 { grid-template-columns: repeat(2, 1fr); }
+  .md\:grid-cols-3 { grid-template-columns: repeat(3, 1fr); }
+  .md\:grid-cols-4 { grid-template-columns: repeat(4, 1fr); }
+}
+
+/* Badges & Verdict Colors */
+.bg-\[\#E60023\] { background: var(--red) !important; color: #fff !important; }
+.bg-\[\#008A2E\] { background: var(--green) !important; color: var(--black) !important; }
+.bg-\[\#D97706\] { background: var(--amber) !important; color: #fff !important; }
+.text-\[\#E60023\] { color: var(--red) !important; }
+.text-\[\#008A2E\] { color: var(--green-dark) !important; }
+.text-\[\#D97706\] { color: var(--amber) !important; }
+.text-cobalt { color: var(--green-dark) !important; }
+
+/* Tables (Verify Matrix) */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+}
+
+th {
+  background: var(--black);
+  color: var(--green-glow);
+  font-family: 'Silkscreen', monospace;
+  font-size: 0.7rem;
+  padding: 0.65rem 0.75rem;
+  text-align: left;
+}
+
+td {
+  padding: 0.6rem 0.75rem;
+  border-top: 2px solid var(--black);
+}
+
+tr:hover td {
+  background: #e8f5e9;
+}
+
+pre {
+  background: var(--black);
+  color: var(--green-glow);
+  padding: 0.75rem;
+  border: 2px solid var(--black);
+  overflow-x: auto;
+  font-size: 0.75rem;
+}

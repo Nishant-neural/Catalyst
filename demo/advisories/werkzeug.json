@@ -1,0 +1,122 @@
+[
+  {
+    "id": "GHSA-f9vj-2wh5-fj8j",
+    "package": "werkzeug",
+    "fixed_version": "3.0.6",
+    "references": [
+      "https://github.com/pallets/werkzeug/security/advisories/GHSA-f9vj-2wh5-fj8j",
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-49766",
+      "https://github.com/pallets/werkzeug/commit/2767bcb10a7dd1c297d812cc5e6d11a474c1f092",
+      "https://github.com/pallets/werkzeug",
+      "https://github.com/pallets/werkzeug/releases/tag/3.0.6",
+      "https://security.netapp.com/advisory/ntap-20250131-0005"
+    ],
+    "summary": "Werkzeug safe_join not safe on Windows | On Python < 3.11 on Windows, `os.path.isabs()` does not catch UNC paths like `//server/share`. Werkzeug's `safe_join()` relies on this check, and so can produce a path that is not safe, potentially allowing unintended access to data. Applications using Python >= 3.11, or not using Windows, are not vulnerable.",
+    "fix_commit": {
+      "repo": "pallets/werkzeug",
+      "sha": "2767bcb10a7dd1c297d812cc5e6d11a474c1f092"
+    },
+    "candidates": [
+      {
+        "qualified": "werkzeug.security.safe_join",
+        "file": "src/werkzeug/security.py",
+        "confidence": "high",
+        "evidence": "2767bcb10a7dd1c297d812cc5e6d11a474c1f092:src/werkzeug/security.py:154"
+      },
+      {
+        "qualified": "os.path.isabs",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions os.path.isabs"
+      }
+    ],
+    "diff_files": [
+      "CHANGES.rst",
+      "src/werkzeug/security.py",
+      "tests/test_security.py"
+    ],
+    "diff_lines": 60,
+    "vulnerable_functions": [
+      {
+        "qualified": "werkzeug.security.safe_join",
+        "file": "src/werkzeug/security.py",
+        "confidence": "high",
+        "evidence": "2767bcb10a7dd1c297d812cc5e6d11a474c1f092:src/werkzeug/security.py:154"
+      },
+      {
+        "qualified": "os.path.isabs",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions os.path.isabs"
+      }
+    ]
+  },
+  {
+    "id": "GHSA-q34m-jh98-gwm2",
+    "package": "werkzeug",
+    "fixed_version": "0.20.0",
+    "references": [
+      "https://github.com/pallets/werkzeug/security/advisories/GHSA-q34m-jh98-gwm2",
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-49767",
+      "https://github.com/pallets/quart/commit/5e78c4169b8eb66b91ead3e62d44721b9e1644ee",
+      "https://github.com/pallets/quart/commit/abb04a512496206de279225340ed022852fbf51f",
+      "https://github.com/pallets/werkzeug/commit/50cfeebcb0727e18cc52ffbeb125f4a66551179b",
+      "https://github.com/pallets/werkzeug/commit/cbb446fdcada7685fce936ded01b76c08dbd6eb5",
+      "https://github.com/pallets/werkzeug",
+      "https://github.com/pallets/werkzeug/releases/tag/3.0.6",
+      "https://security.netapp.com/advisory/ntap-20250103-0007"
+    ],
+    "summary": "Werkzeug possible resource exhaustion when parsing file data in forms | Applications using Werkzeug to parse `multipart/form-data` requests are vulnerable to resource exhaustion. A specially crafted form body can bypass the `Request.max_form_memory_size` setting.\n\n\nThe `Request.max_content_length` setting, as well as resource limits provided by deployment software and platforms, are also available to limit the resources used during a request. This vulnerability does not affect those settings. All three types of limits should be considered and set appropriately when deploying an application.",
+    "fix_commit": {
+      "repo": "pallets/quart",
+      "sha": "5e78c4169b8eb66b91ead3e62d44721b9e1644ee"
+    },
+    "candidates": [
+      {
+        "qualified": "quart.formparser.MultiPartParser.parse",
+        "file": "src/quart/formparser.py",
+        "confidence": "high",
+        "evidence": "5e78c4169b8eb66b91ead3e62d44721b9e1644ee:src/quart/formparser.py:193"
+      },
+      {
+        "qualified": "Request.max_content_length",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions Request.max_content_length"
+      },
+      {
+        "qualified": "Request.max_form_memory_size",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions Request.max_form_memory_size"
+      }
+    ],
+    "diff_files": [
+      "CHANGES.rst",
+      "pyproject.toml",
+      "src/quart/formparser.py",
+      "tests/test_formparser.py"
+    ],
+    "diff_lines": 94,
+    "vulnerable_functions": [
+      {
+        "qualified": "quart.formparser.MultiPartParser.parse",
+        "file": "src/quart/formparser.py",
+        "confidence": "high",
+        "evidence": "5e78c4169b8eb66b91ead3e62d44721b9e1644ee:src/quart/formparser.py:193"
+      },
+      {
+        "qualified": "Request.max_content_length",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions Request.max_content_length"
+      },
+      {
+        "qualified": "Request.max_form_memory_size",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions Request.max_form_memory_size"
+      }
+    ]
+  }
+]

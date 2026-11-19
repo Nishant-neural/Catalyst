@@ -201,3 +201,51 @@ unknown — do not accuse anyone, just do not follow it.
 - `fixtures/` — app_vuln (reachable), app_safe (not-reachable),
   app_dead (dead code), app_getattr (uncertain)
 - `examples/advisory-sample.json` — OSV-style sample for yaml.load
+
+
+## React frontend + local API
+
+The `frontend/` directory contains the React + Vite interface. The API is
+implemented in `pyreach/api.py`; it calls the existing PyReach CLI and keeps
+the deterministic scanner as the source of truth.
+
+Install the API dependencies from the repository root:
+
+```powershell
+python -m pip install -e ".[api]"
+```
+
+Start the backend from the repository root:
+
+```powershell
+uvicorn pyreach.api:app --reload --host 127.0.0.1 --port 8000
+```
+
+In a second terminal, start the existing frontend:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Open the Vite URL printed in the terminal (normally
+`http://localhost:5173`). The frontend's API client defaults to
+`http://localhost:8000`; set `VITE_API_URL` in `frontend/.env` only if the
+backend is running at a different address. `frontend/.env.example` shows the
+default value.
+
+The API exposes `/api/health`, `/api/fixtures`, `/api/scan`, `/api/debate`,
+and `/api/verify`. `/api/scan` passes `--explain` and `--with-deps` by
+default (toggles in the UI) and returns the report with `openvex` merged
+in, so the explainer, the not_reachable proof, and the OpenVEX badge all
+show in the browser; `--with-deps` needs a pinned package + version to
+parse the dependency's source. When no advisory file or live package/version is supplied,
+`/api/scan` uses `examples/advisory-sample.json`, matching the demo fixture
+workflow. Live package scans still use the CLI's OSV fetch pipeline. The
+`/api/verify` endpoint checks every offline fixture listed in `verify.py`
+against its expected verdict and exit code.
+
+Execution proof runs project code in a subprocess and is **not a security
+sandbox**. Only scan projects you trust. Keep API keys in the repository
+`.env` file; never put them in frontend code or commit them.
