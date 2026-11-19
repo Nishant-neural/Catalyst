@@ -111,31 +111,43 @@ export default function AlertCard({
             </p>
           </div>
 
-          {/* Call Path */}
-          {result.path?.length > 0 && (
+          {/* Call Path (ChatGPT fix A: file:line per step, definition lines) */}
+          {((result.path_detail || result.path)?.length || 0) > 0 && (
             <div>
               <div className="font-pixel text-[10px] text-neutral-600 mb-1">
-                CALL PATH (REAL ENTRY POINT -&gt; TARGET)
+                CALL PATH (REAL ENTRY POINT -&gt; TARGET) // FILE:LINE IS
+                WHERE EACH FUNCTION IS DEFINED
               </div>
               <div className="bg-white border border-black p-2.5 flex flex-wrap items-center gap-1.5">
-                {result.path.map((node, i) => (
-                  <span key={i} className="flex items-center gap-1.5">
-                    <code
-                      className={`px-1.5 py-0.5 border border-black ${
-                        i === result.path.length - 1
-                          ? "bg-[#E60023] text-white"
-                          : i === 0
-                          ? "bg-cobalt text-white"
-                          : "bg-paper"
-                      }`}
-                    >
-                      {node}
-                    </code>
-                    {i < result.path.length - 1 && (
-                      <span className="font-pixel text-[10px]">-&gt;</span>
-                    )}
-                  </span>
-                ))}
+                {(result.path_detail ||
+                  result.path.map((p) => ({ function: p }))).map(
+                  (node, i, steps) => (
+                    <span key={i} className="flex items-center gap-1.5">
+                      <span className="flex flex-col items-start">
+                        <code
+                          className={`px-1.5 py-0.5 border border-black ${
+                            i === steps.length - 1
+                              ? "bg-[#E60023] text-white"
+                              : i === 0
+                                ? "bg-cobalt text-white"
+                                : "bg-paper"
+                          }`}
+                        >
+                          {node.function || node}
+                        </code>
+                        {node.file && (
+                          <span className="text-[10px] text-neutral-500 mt-0.5">
+                            {node.file}:
+                            {node.line != null ? node.line : "?"}
+                          </span>
+                        )}
+                      </span>
+                      {i < steps.length - 1 && (
+                        <span className="font-pixel text-[10px]">-&gt;</span>
+                      )}
+                    </span>
+                  )
+                )}
               </div>
               {entryEvidence?.[result.path[0]] && (
                 <div className="mt-1 text-[11px] text-neutral-700">
@@ -149,7 +161,7 @@ export default function AlertCard({
           {proof && (
             <div>
               <div className="font-pixel text-[10px] text-neutral-600 mb-1">
-                EXECUTION WITNESS (ISOLATED SUBPROCESS)
+                EXECUTION WITNESS (SUBPROCESS — NOT A SANDBOX)
               </div>
               <div className="bg-white border border-black p-2.5 space-y-1.5">
                 <div className="flex flex-wrap gap-4">

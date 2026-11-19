@@ -1,5 +1,15 @@
 # Real-project tests — pyreach, 19 Nov 2026
 
+> **Superseded numbers (ChatGPT fix B, 19 Nov 2026).** The verification
+> block below ("65/65 OK", "31/31") and the Phase 8 section's claim
+> "the tool still cannot prove not_reachable on a real project" are
+> Phase 5–8 era and no longer current. Current, as of the final zip:
+> **237 unit tests, `verify.py --live` 61/61, fixtures 40/40**; yamllint
+> is **7/7 not_reachable + 1 OpenVEX** with `--with-deps` (Phase 13),
+> MkDocs 4/3, cookiecutter and bandit 0/7/0 (gate reverted). The
+> authoritative table is **EVALUATION.md §0**. The sections below are
+> kept as history, not as current claims.
+
 Three public Python projects, scanned with the live PyYAML 5.3.1
 advisory (GHSA-8q59-q68h-6hv4, CVE-2020-14343, fixed 5.4), `--no-llm`,
 deterministic only. No LLM, no key. Commands, verbatim:

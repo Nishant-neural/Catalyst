@@ -1,9 +1,9 @@
-# Tests to perform — pyreach, Phases 1–8
+# Tests to perform — pyreach, Phases 1–13 + frontend/API
 
 One command runs everything, and every check prints PASS or FAIL:
 
 ```bash
-python verify.py            # offline: 233 unit tests + 40 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
+python verify.py            # offline: 237 unit tests + 40 fixture scans + prompt + witness + explain + quiet/HTML + scan-all + VEX
 python verify.py --live     # also the real OSV fetch for PyYAML 5.3.1 (needs network)
 ```
 
@@ -39,7 +39,7 @@ exit code versus what it got, per fixture.
 
 ```bash
 python3 -m pytest tests -q
-# if pytest is not installed, the same 189 tests run with stdlib unittest:
+# if pytest is not installed, the same 237 tests run with stdlib unittest:
 python3 -m unittest discover -s tests -q
 ```
 

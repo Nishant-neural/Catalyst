@@ -1484,3 +1484,44 @@ statement. Totals, verified by a full `bash demo/run-demo.sh` run
 (Flask 0/9/0, requests 1/2/0, httpx 1/1/6, yamllint 0/0/7). The web
 demo page (slug pyreach-demo) still shows the three-repo version and
 was NOT rebuilt in this phase.
+
+## Phase 14 — ChatGPT pre-submission fixes, 19 Nov 2026
+
+Three fixes from the second ChatGPT review, all built and verified
+(237 unit tests, `verify.py --live` 61/61, `/api/verify` 40/40):
+
+1. **A — file:line on every call-path step.** `report.json` results now
+   carry `path_detail`: `[{function, file, line}]` per step, definition
+   lines from the graph (`FuncInfo.file/start`), paths relative to the
+   project root or the dep cache (`deps/<pkg>-<version>/...`). A step
+   the graph only knows as a placeholder (`file "external", start 0`)
+   is reported as `file "external", line null` — never a made-up line.
+   Call-site lines are NOT claimed: resolved edges do not store which
+   line called them. Rendered in the HTML report (`app.main
+   (app.py:15) -> ... -> yaml.load (external:?)`, old reports without
+   `path_detail` fall back to bare names) and in React (file:line under
+   each chip). `path` (plain strings) is unchanged for compatibility.
+   Tests: `tests/test_path_detail.py` (4).
+2. **B — one authoritative evaluation table.** `EVALUATION.md §0` is now
+   the single source of truth (237 tests, 61/61, 40/40 fixtures,
+   demo 27 results, 7 real projects 4/38/7 + 1 VEX, sandbox incomplete,
+   LLM live run not done, fix-commit proven on 1 advisory). §2 rewritten
+   to 40/40 (was 35/35, "50 passed", 182 tests); §3 updated to Phase 13
+   numbers (yamllint 7/7 not_reachable + 1 VEX; pre-commit/ansible-lint/
+   Kedro marked † as Phase 9 numbers); REAL_PROJECTS.md gets a
+   supersede banner; TESTS.md 189 -> 237, verify.py labels 233 -> 237.
+   One correction to the review: verify.py's "233 tests" was NOT stale
+   before this phase — it became stale only because fix A added 4 tests.
+3. **C — execution isolation, option 2.** No container sandbox built
+   (~70 min left, not safely testable on Windows in that window). The
+   witness is now labelled everywhere as a subprocess runtime witness,
+   not a sandbox: README, App hero, AlertCard heading, EVALUATION.md
+   ("sandboxing incomplete"). The CLI warning and proof.py note were
+   already honest; only the "isolated" display wording overclaimed.
+
+Render-checked in jsdom on the built UI: app_vuln call path shows
+`app.py:15`, `app.py:10`, `external:?`; "SUBPROCESS — NOT A SANDBOX"
+heading present, no "isolated" wording left; all three scans keep
+their verdicts. Known open item NOT fixed here: the AlertCard debate
+"Current verdict" goes stale when re-scanning the same advisory
+(React reuses the card by key) — offered to the user, awaiting a yes.

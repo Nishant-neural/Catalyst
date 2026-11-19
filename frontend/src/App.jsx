@@ -99,9 +99,9 @@ export default function App() {
                 pyreach
               </h1>
               <p className="text-xs text-neutral-700 mt-1 max-w-xl">
-                AST call graph + real entry points + isolated execution witness
-                + OpenVEX. Never marks a reachable vulnerability as
-                not-reachable.
+                AST call graph + real entry points + subprocess runtime
+                witness (not a sandbox) + OpenVEX. Never marks a reachable
+                vulnerability as not-reachable.
               </p>
             </div>
             {report && (

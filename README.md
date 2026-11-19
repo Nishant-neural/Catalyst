@@ -53,7 +53,8 @@ python -m pytest tests/ -q
 4. LLM resolver, uncertain dynamic cases only (getattr, importlib,
    plugins). Small open-weight model, temp 0, verified by code.
    No key -> stays uncertain, which is safe.
-5. Execution proof in an isolated subprocess, plus a PR debate agent
+5. Execution proof in a subprocess (a runtime witness, not a sandbox —
+   no network or filesystem isolation), plus a PR debate agent
    that must cite a line or flip to uncertain.
 6. **Explainer for uncertain results** (`--explain` / `explain`):
    deterministic explanation first — blocker, partial path, blocked

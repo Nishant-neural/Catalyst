@@ -162,9 +162,9 @@ def main() -> int:
     if "No module named pytest" in r.stderr:
         r = run(["-m", "unittest", "discover", "-s", "tests", "-q"])
         detail = (r.stderr.strip().splitlines() or [""])[-1]
-        check("unittest suite (233 tests, pytest not installed)", r.returncode == 0, detail)
+        check("unittest suite (237 tests, pytest not installed)", r.returncode == 0, detail)
     else:
-        check("pytest suite (233 tests)", r.returncode == 0,
+        check("pytest suite (237 tests)", r.returncode == 0,
               r.stdout.strip().splitlines()[-1] if r.stdout.strip() else r.stderr[-300:])
 
     print("B. fixture scans (sample advisory, no network)")

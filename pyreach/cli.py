@@ -225,6 +225,44 @@ def _parse_dependencies(graph, advisories, cache, args, packages=None):
         print(f"dependency: {adv.package} {version} — parsed {parsed_n}/{discovered} modules ({import_name})")
 
 
+def _path_detail(graph, root, cache_dir, path):
+    """File + definition line for every call-path step (ChatGPT fix A,
+    19 Nov 2026).
+
+    The graph records each function's definition file and start line
+    (FuncInfo.file/start), so a judge can open file:line and inspect the
+    evidence instead of trusting bare function names. Lines are
+    definition lines, not call-site lines: resolved edges do not store
+    which line called them (raw_calls only keeps unresolved names), so a
+    call-site line per step cannot be derived soundly. A step the graph
+    does not know (e.g. yaml.load with the dependency unparsed) is
+    reported as file "external", line null — never invented. Paths are
+    relative to the project root, or to the cache dir for dependency
+    sources (deps/<pkg>-<version>/...).
+    """
+    detail = []
+    for q in path:
+        info = graph.functions.get(q)
+        # External placeholders (file "external", start 0) are not real
+        # locations: report them as unknown, never as line 0.
+        if info is None or info.file == "external" or info.start <= 0:
+            detail.append({"function": q, "file": "external", "line": None})
+            continue
+        f = Path(info.file)
+        rel = None
+        for base in (root, cache_dir):
+            if base is None:
+                continue
+            try:
+                rel = str(f.relative_to(Path(base)))
+                break
+            except (ValueError, TypeError):
+                continue
+        detail.append({"function": q, "file": rel if rel is not None else str(f),
+                       "line": info.start})
+    return detail
+
+
 def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
               args, packages=None):
     """Phases 2-5 + explainer + report for one advisory list.
@@ -539,7 +577,9 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
             {"advisory_id": r.advisory_id, "package": r.package,
              "vulnerable_function": r.vulnerable_function, "verdict": r.verdict,
              "confidence": r.confidence, "path": r.path, "reason": r.reason,
-             "entry_file": getattr(r, "entry_file", "")}
+             "entry_file": getattr(r, "entry_file", ""),
+             "path_detail": _path_detail(
+                 graph, root, cache.dir if cache is not None else None, r.path)}
             for r in results
         ],
         "proofs": proofs,

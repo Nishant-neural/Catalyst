@@ -107,7 +107,18 @@ def render_html(report: dict) -> str:
 
     result_rows = []
     for r in results:
-        path = " -&gt; ".join(_esc(p) for p in (r.get("path") or [])) or "—"
+        # ChatGPT fix A (19 Nov 2026): show file:line per call-path step
+        # when the report carries path_detail; old reports without it
+        # fall back to bare function names.
+        pd = r.get("path_detail")
+        if pd:
+            def _step(d):
+                loc = (f"{d.get('file', 'external')}:"
+                       f"{d.get('line') if d.get('line') is not None else '?'}")
+                return f"{d.get('function', '?')} ({loc})"
+            path = " -&gt; ".join(_esc(_step(d)) for d in pd) or "—"
+        else:
+            path = " -&gt; ".join(_esc(p) for p in (r.get("path") or [])) or "—"
         reason = r.get("reason", "") or ""
         short = reason[:160] + ("…" if len(reason) > 160 else "")
         result_rows.append(
