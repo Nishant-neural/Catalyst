@@ -1,0 +1,5 @@
+# requests runtime deps, pinned to 2023 versions.
+certifi==2023.7.22
+charset-normalizer==3.2.0
+idna==3.4
+urllib3==1.26.18

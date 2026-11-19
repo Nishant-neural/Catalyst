@@ -1,0 +1,130 @@
+[
+  {
+    "id": "GHSA-82r6-8w77-94w6",
+    "package": "anyio",
+    "fixed_version": "4.14.2",
+    "references": [
+      "https://github.com/agronholm/anyio/security/advisories/GHSA-82r6-8w77-94w6",
+      "https://github.com/agronholm/anyio/pull/1208",
+      "https://github.com/agronholm/anyio/commit/68f58915f82d9be8109ebbbd8f5d70577d43f2ce",
+      "https://github.com/agronholm/anyio",
+      "https://github.com/agronholm/anyio/releases/tag/4.14.2"
+    ],
+    "summary": "AnyIO: TLSStream IDNA 2003 host name encoding enables potential TLS certificate spoofing | ### Impact\nServices using internationalized (non-ASCII) domain names are potentially vulnerable to TLS connections made from AnyIO's `connect_tcp()` or directly via `TLSStream.wrap()` where the connection has (through other means) been hijacked and redirected to a malicious server. The attacker would obtain a legitimate certificate using the IDNA 2003 encoded version of the domain name and offer it to the connecting client, making the certificate validate properly on the client's end.\n\n### Patches\nThe vulnerability will be patched in v4.14.2.\n\n### Workarounds\nEncode host names via the `idna` package prior to connecting.",
+    "fix_commit": {
+      "repo": "agronholm/anyio",
+      "sha": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce"
+    },
+    "candidates": [
+      {
+        "qualified": "anyio._core._sockets.idna2008_resolve",
+        "file": "src/anyio/_core/_sockets.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/_core/_sockets.py:64"
+      },
+      {
+        "qualified": "anyio._core._sockets.getaddrinfo",
+        "file": "src/anyio/_core/_sockets.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/_core/_sockets.py:656"
+      },
+      {
+        "qualified": "anyio.streams.tls.TLSStream.wrap",
+        "file": "src/anyio/streams/tls.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/streams/tls.py:160"
+      },
+      {
+        "qualified": "TLSStream.wrap",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions TLSStream.wrap"
+      }
+    ],
+    "diff_files": [
+      "docs/versionhistory.rst",
+      "src/anyio/_core/_sockets.py",
+      "src/anyio/streams/tls.py",
+      "tests/streams/test_tls.py",
+      "tests/test_sockets.py"
+    ],
+    "diff_lines": 199,
+    "vulnerable_functions": [
+      {
+        "qualified": "anyio._core._sockets.idna2008_resolve",
+        "file": "src/anyio/_core/_sockets.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/_core/_sockets.py:64"
+      },
+      {
+        "qualified": "anyio._core._sockets.getaddrinfo",
+        "file": "src/anyio/_core/_sockets.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/_core/_sockets.py:656"
+      },
+      {
+        "qualified": "anyio.streams.tls.TLSStream.wrap",
+        "file": "src/anyio/streams/tls.py",
+        "confidence": "medium",
+        "evidence": "68f58915f82d9be8109ebbbd8f5d70577d43f2ce:src/anyio/streams/tls.py:160"
+      },
+      {
+        "qualified": "TLSStream.wrap",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions TLSStream.wrap"
+      }
+    ]
+  },
+  {
+    "id": "GHSA-5p39-cfhj-2xmp",
+    "package": "anyio",
+    "fixed_version": "4.14.2",
+    "references": [
+      "https://github.com/agronholm/anyio/security/advisories/GHSA-5p39-cfhj-2xmp",
+      "https://github.com/agronholm/anyio/pull/1207",
+      "https://github.com/agronholm/anyio/commit/f1b7301c8264b0d2e8d24a5788fd29e93dea4040",
+      "https://github.com/agronholm/anyio",
+      "https://github.com/agronholm/anyio/releases/tag/4.14.2"
+    ],
+    "summary": "AnyIO process-pool workers can block indefinitely on undrained stderr | ### Impact\nAnyIO starts process-pool workers with stderr connected to a pipe but never drains that pipe. The worker redirects stdin and stdout to /dev/null to protect its protocol, but does not redirect stderr even though the documentation says all three standard streams are redirected. Worker code that writes enough attacker-influenced data to stderr can fill the pipe, block before returning the stdout protocol response, and wedge the awaiting process-pool call.\n\nAnyone who runs untrusted or faulty code that writes too much to `stderr` is at risk.\n\n### Patches\nThis vulnerability will be patched in v4.14.2.\n\n### Workarounds\nClosing `sys.stderr` in the target function should at least prevent the deadlock.",
+    "fix_commit": {
+      "repo": "agronholm/anyio",
+      "sha": "f1b7301c8264b0d2e8d24a5788fd29e93dea4040"
+    },
+    "candidates": [
+      {
+        "qualified": "anyio.to_process.process_worker",
+        "file": "src/anyio/to_process.py",
+        "confidence": "high",
+        "evidence": "f1b7301c8264b0d2e8d24a5788fd29e93dea4040:src/anyio/to_process.py:214"
+      },
+      {
+        "qualified": "sys.stderr",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions sys.stderr"
+      }
+    ],
+    "diff_files": [
+      "docs/versionhistory.rst",
+      "src/anyio/to_process.py",
+      "tests/test_to_process.py"
+    ],
+    "diff_lines": 71,
+    "vulnerable_functions": [
+      {
+        "qualified": "anyio.to_process.process_worker",
+        "file": "src/anyio/to_process.py",
+        "confidence": "high",
+        "evidence": "f1b7301c8264b0d2e8d24a5788fd29e93dea4040:src/anyio/to_process.py:214"
+      },
+      {
+        "qualified": "sys.stderr",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions sys.stderr"
+      }
+    ]
+  }
+]

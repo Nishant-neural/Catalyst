@@ -1,0 +1,59 @@
+[
+  {
+    "id": "GHSA-jjg7-2v4v-x38h",
+    "package": "idna",
+    "fixed_version": "3.7",
+    "references": [
+      "https://github.com/kjd/idna/security/advisories/GHSA-jjg7-2v4v-x38h",
+      "https://nvd.nist.gov/vuln/detail/CVE-2024-3651",
+      "https://github.com/kjd/idna/commit/1d365e17e10d72d0b7876316fc7b9ca0eebdd38d",
+      "https://github.com/kjd/idna",
+      "https://github.com/pypa/advisory-database/tree/main/vulns/idna/PYSEC-2024-60.yaml",
+      "https://huntr.com/bounties/93d78d07-d791-4b39-a845-cbfabc44aadb",
+      "https://lists.debian.org/debian-lts-announce/2024/05/msg00006.html",
+      "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/4YQUPYH3SVZ5GFF2CDQ55FCM575AZTF2",
+      "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/F2S5E23N6E52S46KGNYTDFB75LOC4N4D",
+      "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/S5IDLLD2IKSIVRBSLB34WTSYGLMWUFWF",
+      "https://lists.fedoraproject.org/archives/list/package-announce@lists.fedoraproject.org/message/ULSC7HBJKXB3BZV367WM5BR6DFEC4Z43"
+    ],
+    "summary": "Internationalized Domain Names in Applications (IDNA) vulnerable to denial of service from specially crafted inputs to idna.encode | ### Impact\nA specially crafted argument to the `idna.encode()` function could consume significant resources. This may lead to a denial-of-service.\n\n### Patches\nThe function has been refined to reject such strings without the associated resource consumption in version 3.7.\n\n### Workarounds\nDomain names cannot exceed 253 characters in length, if this length limit is enforced prior to passing the domain to the `idna.encode()` function it should no longer consume significant resources. This is triggered by arbitrarily large inputs that would not occur in normal usage, but may be passed to the library assuming there is no preliminary input validation by the higher-level application.\n\n### References\n* https://huntr.com/bounties/93d78d07-d791-4b39-a845-cbfabc44aadb",
+    "fix_commit": {
+      "repo": "kjd/idna",
+      "sha": "1d365e17e10d72d0b7876316fc7b9ca0eebdd38d"
+    },
+    "candidates": [
+      {
+        "qualified": "huntr.com",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions huntr.com"
+      },
+      {
+        "qualified": "idna.encode",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions idna.encode"
+      }
+    ],
+    "diff_files": [
+      "HISTORY.rst",
+      "LICENSE.md",
+      "idna/package_data.py"
+    ],
+    "diff_lines": 39,
+    "vulnerable_functions": [
+      {
+        "qualified": "huntr.com",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions huntr.com"
+      },
+      {
+        "qualified": "idna.encode",
+        "file": "advisory-text",
+        "confidence": "medium",
+        "evidence": "advisory text mentions idna.encode"
+      }
+    ]
+  }
+]

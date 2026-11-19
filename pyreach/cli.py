@@ -418,6 +418,10 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
             if entry_q not in graph.functions:
                 continue
             entry_file = str(Path(graph.functions[entry_q].file).resolve())
+            # The UI debate needs the exact file a citation line lives in;
+            # record it on the result so the report carries it (the API
+            # used to fall back to searching the whole project for it).
+            r.entry_file = entry_file
             # Strip the module prefix: app.Loader.load_config -> Loader.load_config
             mod = entry_q.rsplit(".", 1)[0] if "." in entry_q else ""
             entry_func = entry_q[len(mod) + 1:] if mod and entry_q.startswith(mod + ".") else entry_q.split(".")[-1]
@@ -534,7 +538,8 @@ def _run_scan(root, advisories, cache, use_llm, model, allow_fallback,
         "results": [
             {"advisory_id": r.advisory_id, "package": r.package,
              "vulnerable_function": r.vulnerable_function, "verdict": r.verdict,
-             "confidence": r.confidence, "path": r.path, "reason": r.reason}
+             "confidence": r.confidence, "path": r.path, "reason": r.reason,
+             "entry_file": getattr(r, "entry_file", "")}
             for r in results
         ],
         "proofs": proofs,
